@@ -35,7 +35,7 @@ if API_BASE_URL and not API_BASE_URL.startswith("http"):
 app = FastAPI(title="TOON vs JSON Benchmark Frontend")
 
 
-@app.head("/health")
+@app.get("/health")
 def health():
     return {"status": "ok"}
 
