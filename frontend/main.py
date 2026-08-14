@@ -45,11 +45,26 @@ def api_base():
     return {"api_base_url": API_BASE_URL}
 
 
+@app.get("/debug-connection")
+def debug_connection():
+    """Directly tests whether this service can reach the API service, and reports exactly why if not."""
+    try:
+        with httpx.Client(timeout=60) as client:
+            r = client.get(f"{API_BASE_URL}/health")
+        return {"api_base_url": API_BASE_URL, "reachable": True, "status_code": r.status_code, "body": r.text}
+    except httpx.ConnectError as e:
+        return {"api_base_url": API_BASE_URL, "reachable": False, "error": "connect_error", "detail": str(e)}
+    except httpx.TimeoutException as e:
+        return {"api_base_url": API_BASE_URL, "reachable": False, "error": "timeout", "detail": str(e)}
+    except Exception as e:
+        return {"api_base_url": API_BASE_URL, "reachable": False, "error": type(e).__name__, "detail": str(e)}
+
+
 def run_plain_case(structure, n, encoding, repeats):
     results = {}
     for fmt in ["json", "toon"]:
         latencies, raw_b, comp_b, enc_ms = [], 0, 0, 0
-        with httpx.Client(timeout=30) as client:
+        with httpx.Client(timeout=60) as client:
             for _ in range(repeats):
                 headers = {"Accept-Encoding": {"identity": "identity", "gzip": "gzip", "brotli": "br"}[encoding]}
                 t0 = time.perf_counter()
@@ -74,7 +89,7 @@ def run_cache_case(mode, structure, n, repeats):
     results = {}
     formats_to_test = ["json", "toon"] if mode == "canonical_cache" else \
                        (["json"] if mode == "json_cache" else ["toon"])
-    with httpx.Client(timeout=30) as client:
+    with httpx.Client(timeout=60) as client:
         client.post(f"{API_BASE_URL}/cache/clear")
         for fmt in formats_to_test:
             latencies, hits, byte_counts = [], 0, []
@@ -105,12 +120,26 @@ def run_cache_case(mode, structure, n, repeats):
 @app.get("/run")
 def run(case_type: str = Query("plain"), structure: str = Query("flat"), n: int = Query(1000),
          encoding: str = Query("identity"), mode: str = Query("json_cache"), repeats: int = Query(15)):
-    if case_type == "cache":
-        data = run_cache_case(mode, structure, n, repeats)
-    else:
-        data = run_plain_case(structure, n, encoding, repeats)
-    return {"case_type": case_type, "structure": structure, "n": n, "encoding": encoding,
-            "mode": mode, "repeats": repeats, "results": data}
+    try:
+        if case_type == "cache":
+            data = run_cache_case(mode, structure, n, repeats)
+        else:
+            data = run_plain_case(structure, n, encoding, repeats)
+        return {"case_type": case_type, "structure": structure, "n": n, "encoding": encoding,
+                "mode": mode, "repeats": repeats, "results": data}
+    except httpx.ConnectError as e:
+        return {"error": "connect_error",
+                "message": f"Could not reach the API service at {API_BASE_URL}. "
+                            f"Check that API_BASE_URL is set correctly on the frontend service, "
+                            f"and that the API service is deployed and awake. Detail: {e}"}
+    except httpx.TimeoutException as e:
+        return {"error": "timeout",
+                "message": f"Request to {API_BASE_URL} timed out -- this usually means the API "
+                            f"service was asleep (Render free tier cold start can take 30-60s). "
+                            f"Try hitting {API_BASE_URL}/health directly first to wake it, then retry. "
+                            f"Detail: {e}"}
+    except Exception as e:
+        return {"error": "unexpected", "message": f"{type(e).__name__}: {e}", "api_base_url": API_BASE_URL}
 
 
 INDEX_HTML = """
