@@ -99,7 +99,7 @@ def compress(body: bytes, encoding: str) -> bytes:
     return body
 
 
-@app.head("/health")
+@app.get("/health")
 def health():
     return {"status": "ok"}
 
