@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: toon-benchmark-api
+    runtime: python
+    plan: free
+    region: singapore   # Singapore
+    rootDir: api
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+
+  - type: web
+    name: toon-benchmark-frontend
+    runtime: python
+    plan: free
+    region: ohio   # US East -- real intercontinental distance from the api service (Singapore)
+    rootDir: frontend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: API_BASE_URL
+        fromService:
+          name: toon-benchmark-api
+          type: web
+          property: host
