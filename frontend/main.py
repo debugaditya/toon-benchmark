@@ -231,8 +231,14 @@ async function runCase() {
   try {
     const res = await fetch('/run?' + params.toString());
     const data = await res.json();
-    render(data);
-    status.textContent = 'Done.';
+    if (data.error) {
+      status.textContent = 'Error (' + data.error + ')';
+      document.getElementById('resultsArea').innerHTML =
+        '<p style="color:#b00">' + data.message + '</p>';
+    } else {
+      render(data);
+      status.textContent = 'Done.';
+    }
   } catch (e) {
     status.textContent = 'Error: ' + e;
   }
