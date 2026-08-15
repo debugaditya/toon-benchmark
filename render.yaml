@@ -20,7 +20,4 @@ services:
     healthCheckPath: /health
     envVars:
       - key: API_BASE_URL
-        fromService:
-          name: toon-benchmark-api
-          type: web
-          property: host
+        value: https://toon-benchmark-api.onrender.com   # public URL -- private "host" property doesn't work cross-region, see README

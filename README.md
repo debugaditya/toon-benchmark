@@ -22,11 +22,35 @@ git push -u origin main
 
 ## 2. Deploy on Render
 
+This deploys the two services **in different regions on purpose** —
+`toon-benchmark-api` in **Singapore** and `toon-benchmark-frontend` in
+**Ohio (US East)** — so the benchmark includes real, substantial network
+latency instead of the near-zero localhost latency from earlier tests.
+
+**Important: `API_BASE_URL` must be a public URL, not a private hostname.**
+Render's `fromService` / `property: host` returns the service's *private
+network* hostname (e.g. `toon-benchmark-api`, no `.onrender.com`), which only
+resolves between services **in the same region**. Since these two services
+are deliberately in different regions, that private hostname is unresolvable
+from the other region — it causes a DNS failure (`Name or service not known`),
+not a connection or timeout error. This is why `render.yaml` sets
+`API_BASE_URL` as a plain public URL (`https://toon-benchmark-api.onrender.com`)
+instead of using `fromService`.
+
+If you deployed before this fix and are still seeing the DNS error: go to
+the **frontend service → Environment tab** on Render and manually set
+`API_BASE_URL` to the API service's exact public URL shown on its own
+dashboard page (copy it exactly — Render sometimes appends a random suffix
+to the subdomain if the plain name was taken), then save (this triggers a
+redeploy).
+
 **Option A — Blueprint (recommended, one click):**
 1. In the Render dashboard: New -> Blueprint -> connect this repo.
 2. Render reads `render.yaml` and creates both services automatically, wiring
    `API_BASE_URL` on the frontend to the API service's hostname for you.
-3. Click Apply. Both services deploy (free tier).
+3. Click Apply. Both services deploy (free tier). After the api service is
+   live, double-check the frontend's `API_BASE_URL` env var matches the
+   api service's actual public URL exactly (see note above).
 
 **Option B — Manual (two separate Web Services):**
 1. New -> Web Service -> connect repo -> set **Root Directory** to `api`.
