@@ -66,11 +66,9 @@ def run_plain_case(structure, n, encoding, repeats):
         latencies, raw_b, comp_b, enc_ms = [], 0, 0, 0
         with httpx.Client(timeout=60) as client:
             for _ in range(repeats):
-                headers = {"Accept-Encoding": {"identity": "identity", "gzip": "gzip", "brotli": "br"}[encoding]}
                 t0 = time.perf_counter()
                 r = client.get(f"{API_BASE_URL}/data",
-                                params={"format": fmt, "encoding": encoding, "n": n, "structure": structure},
-                                headers=headers)
+                                params={"format": fmt, "encoding": encoding, "n": n, "structure": structure})
                 latencies.append((time.perf_counter() - t0) * 1000)
                 raw_b = int(r.headers.get("x-raw-bytes", 0))
                 comp_b = int(r.headers.get("x-compressed-bytes", 0))
@@ -119,7 +117,7 @@ def run_cache_case(mode, structure, n, repeats):
 
 @app.get("/run")
 def run(case_type: str = Query("plain"), structure: str = Query("flat"), n: int = Query(1000),
-         encoding: str = Query("identity"), mode: str = Query("json_cache"), repeats: int = Query(15)):
+         encoding: str = Query("gzip"), mode: str = Query("json_cache"), repeats: int = Query(15)):
     try:
         if case_type == "cache":
             data = run_cache_case(mode, structure, n, repeats)
@@ -181,11 +179,11 @@ INDEX_HTML = """
   </div>
   <div class="field">
     <label>n (records)</label>
-    <select id="n"><option value="10">10</option><option value="1000">1000</option><option value="10000" selected>10000</option></select>
+    <select id="n"><option value="1000">1000</option><option value="10000" selected>10000</option></select>
   </div>
   <div class="field" id="encodingField">
     <label>Compression</label>
-    <select id="encoding"><option value="identity">none</option><option value="gzip">gzip</option><option value="brotli">brotli</option></select>
+    <select id="encoding"><option value="gzip">gzip</option><option value="brotli">brotli</option></select>
   </div>
   <div class="field" id="modeField" style="display:none">
     <label>Cache mode</label>
