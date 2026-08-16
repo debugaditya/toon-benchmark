@@ -1,27 +1,30 @@
 """
-TOON vs JSON benchmark API -- v2.
+TOON vs JSON benchmark API -- v3.
 
-Two GENUINELY SEPARATE database files per structure, loaded once at startup:
-    data/dataset_flat.json / data/dataset_nested.json   -- JSON source of truth
-    data/dataset_flat.toon / data/dataset_nested.toon   -- TOON source of truth
+Changes from v2 (see accompanying explanation for full rationale):
+  - Compression LEVEL is now an explicit, validated query parameter, not hardcoded.
+  - Content-Encoding uses the correct standard token "br" for Brotli (was "brotli").
+  - Headers renamed for clarity: X-Serialization-Time-Ms, X-Compression-Time-Ms,
+    X-Server-Processing-Time-Ms (serialization + compression only, no network).
+  - Startup validation: JSON_DB and TOON_DB are asserted semantically equal, once,
+    at import time. Startup fails loudly if they ever diverge.
+  - New "source" param on /data: "auto" (default -- json format reads JSON_DB,
+    toon format reads TOON_DB), "json_db", or "toon_db" to force either format
+    to be served from the OTHER database. This lets you test whether serving
+    TOON output sourced from the JSON database (or vice versa) behaves any
+    differently from the native pairing -- a robustness/equivalence check.
+  - /health reports actual brotli availability so level-11-unavailable is never
+    silently swallowed.
 
-The TOON files are NOT derived from the JSON files at request time (or at
-import time) -- they're independent bundled files generated once (see
-build_data.py) and parsed back into Python rows via toon_codec.decode_toon()
-at server startup. Serving a JSON request never touches the .toon file, and
-serving a TOON request never touches the .json file. The only reason both
-happen to contain identical content is that build_data.py generated them
-from the same fixed-seed source values once, offline.
-
-Endpoints:
-    GET /health       -> status + brotli availability (diagnoses build issues)
-    GET /cases        -> list of available experiment cases
-    GET /data          -> format x compression (no caching)
-    GET /cache/data     -> the 3 caching modes
-    POST /cache/clear
+Preserved from v2 (unchanged by design, per requirements):
+  - GET /health, GET /cases, GET /data, GET /cache/data, POST /cache/clear
+  - Two independent database files (dataset_flat.json/.toon, dataset_nested.json/.toon)
+  - /data never converts JSON<->TOON at request time; only /cache/data's
+    canonical_cache mode does a deliberate, measured conversion on read.
 """
 import gzip
 import json
+import sys
 import time
 from io import BytesIO
 from pathlib import Path
@@ -40,56 +43,73 @@ except ImportError as e:
     HAVE_BROTLI = False
     _BROTLI_IMPORT_ERROR = str(e)
 
-app = FastAPI(title="TOON vs JSON Benchmark API v2")
+app = FastAPI(title="TOON vs JSON Benchmark API v3")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 DATA_DIR = Path(__file__).parent / "data"
 
-# JSON database -- loaded directly, never touches TOON
 JSON_DB = {
     "flat": json.loads((DATA_DIR / "dataset_flat.json").read_text()),
     "nested": json.loads((DATA_DIR / "dataset_nested.json").read_text()),
 }
-
-# TOON database -- loaded from its OWN bundled .toon file, parsed once via
-# the codec's decoder. Never derived from JSON_DB.
 TOON_DB = {
     "flat": decode_toon((DATA_DIR / "dataset_flat.toon").read_text(), "flat"),
     "nested": decode_toon((DATA_DIR / "dataset_nested.toon").read_text(), "nested"),
 }
 
+
+def _validate_db_equivalence():
+    """Runs ONCE at startup (import time), never per-request. Fails loudly and
+    aborts startup if the two databases are not semantically identical -- the
+    whole benchmark's validity depends on JSON and TOON representing the same
+    underlying data."""
+    for structure in ("flat", "nested"):
+        if JSON_DB[structure] != TOON_DB[structure]:
+            print(f"FATAL: JSON_DB['{structure}'] != TOON_DB['{structure}'] -- "
+                  f"the two databases are not semantically equivalent. Aborting startup.",
+                  file=sys.stderr)
+            sys.exit(1)
+    print(f"Startup validation OK: JSON_DB and TOON_DB are semantically equal "
+          f"({len(JSON_DB['flat'])} flat, {len(JSON_DB['nested'])} nested records).")
+
+
+_validate_db_equivalence()
+
 N_CHOICES = [1000, 10000]
-ENCODING_CHOICES = ["gzip", "brotli"]
+GZIP_LEVELS = [1, 5, 9]
+BROTLI_LEVELS = [1, 5, 9, 11]
 STRUCTURE_CHOICES = ["flat", "nested"]
 
 
-def compress(body: bytes, encoding: str) -> bytes:
-    # Normalize encoding names -- callers may send "br" or "brotli", "gzip", or
-    # "identity"/"none". This was the actual root cause of the earlier bug:
-    # the frontend sent "brotli" as the query param, but this function only
-    # matched the literal string "br", so brotli silently never triggered --
-    # even though the brotli package itself was installed and working fine.
+def compress(body: bytes, encoding: str, level: int | None):
+    """Returns (compressed_bytes, actual_level_used, content_encoding_token)."""
     encoding = (encoding or "identity").lower()
+
     if encoding == "gzip":
+        lvl = level if level in GZIP_LEVELS else 9
         buf = BytesIO()
-        with gzip.GzipFile(fileobj=buf, mode="wb", compresslevel=9) as f:
+        with gzip.GzipFile(fileobj=buf, mode="wb", compresslevel=lvl) as f:
             f.write(body)
-        return buf.getvalue()
+        return buf.getvalue(), lvl, "gzip"
+
     if encoding in ("br", "brotli"):
         if not HAVE_BROTLI:
             raise RuntimeError(
                 f"Brotli requested but not available on this server "
                 f"(import error: {_BROTLI_IMPORT_ERROR}). Check /health.")
+        lvl = level if level in BROTLI_LEVELS else 5
         try:
-            return brotli.compress(body, quality=11)
+            return brotli.compress(body, quality=lvl), lvl, "br"
         except Exception as e:
             raise RuntimeError(f"Brotli compression failed at runtime: {e}")
-    return body
+
+    return body, None, None
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "brotli_available": HAVE_BROTLI, "brotli_import_error": _BROTLI_IMPORT_ERROR}
+    return {"status": "ok", "brotli_available": HAVE_BROTLI, "brotli_import_error": _BROTLI_IMPORT_ERROR,
+            "gzip_levels": GZIP_LEVELS, "brotli_levels": BROTLI_LEVELS}
 
 
 @app.get("/cases")
@@ -97,8 +117,11 @@ def cases():
     base = []
     for structure in STRUCTURE_CHOICES:
         for n in N_CHOICES:
-            for encoding in ENCODING_CHOICES:
-                base.append({"type": "plain", "structure": structure, "n": n, "encoding": encoding})
+            base.append({"type": "plain", "structure": structure, "n": n, "encoding": "identity", "level": None})
+            for lvl in GZIP_LEVELS:
+                base.append({"type": "plain", "structure": structure, "n": n, "encoding": "gzip", "level": lvl})
+            for lvl in BROTLI_LEVELS:
+                base.append({"type": "plain", "structure": structure, "n": n, "encoding": "brotli", "level": lvl})
     for mode in ["json_cache", "toon_cache", "canonical_cache"]:
         for structure in STRUCTURE_CHOICES:
             base.append({"type": "cache", "mode": mode, "structure": structure, "n": 10000})
@@ -107,45 +130,63 @@ def cases():
 
 @app.get("/data")
 def get_data(format: str = Query("json"), encoding: str = Query("identity"),
-             n: int = Query(10), structure: str = Query("flat")):
+             level: int | None = Query(None), n: int = Query(10), structure: str = Query("flat"),
+             source: str = Query("auto")):
+    # source: "auto" -> json format reads JSON_DB, toon format reads TOON_DB (native pairing).
+    # "json_db" / "toon_db" -> force EITHER format to read from the specified database,
+    # to test cross-database equivalence (e.g. TOON output sourced from JSON_DB).
+    if source == "auto":
+        src = "json_db" if format != "toon" else "toon_db"
+    elif source in ("json_db", "toon_db"):
+        src = source
+    else:
+        raise HTTPException(status_code=400, detail=f"Invalid source '{source}'; use auto, json_db, or toon_db.")
+
+    db = JSON_DB if src == "json_db" else TOON_DB
+
     t0 = time.perf_counter()
     if format == "toon":
-        rows = TOON_DB[structure][:n]
+        rows = db[structure][:n]
         body_str = encode_toon(rows, structure)
         media = "text/toon"
     else:
-        rows = JSON_DB[structure][:n]
+        rows = db[structure][:n]
         body_str = json.dumps(rows)
         media = "application/json"
-    encode_ms = (time.perf_counter() - t0) * 1000
+    serialization_ms = (time.perf_counter() - t0) * 1000
 
     body = body_str.encode("utf-8")
     raw_len = len(body)
 
     t1 = time.perf_counter()
     try:
-        body = compress(body, encoding)
+        body, actual_level, content_encoding_token = compress(body, encoding, level)
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
-    compress_ms = (time.perf_counter() - t1) * 1000
+    compression_ms = (time.perf_counter() - t1) * 1000
+
+    server_processing_ms = serialization_ms + compression_ms  # excludes network by design
 
     headers = {
-        "X-Encode-Time-Ms": f"{encode_ms:.4f}",
-        "X-Compress-Time-Ms": f"{compress_ms:.4f}",
+        "X-Serialization-Time-Ms": f"{serialization_ms:.4f}",
+        "X-Compression-Time-Ms": f"{compression_ms:.4f}",
+        "X-Server-Processing-Time-Ms": f"{server_processing_ms:.4f}",
         "X-Raw-Bytes": str(raw_len),
         "X-Compressed-Bytes": str(len(body)),
+        "X-Encoding": encoding,
+        "X-Level": str(actual_level) if actual_level is not None else "",
+        "X-Source-DB": src,
     }
-    if encoding != "identity":
-        headers["Content-Encoding"] = encoding
+    if content_encoding_token:
+        headers["Content-Encoding"] = content_encoding_token  # "gzip" or "br" -- standard tokens
     return Response(content=body, media_type=media, headers=headers)
 
 
-# ---------- Cache layer: 3 modes, now working for BOTH structures ----------
+# ---------- Cache layer: unchanged design (kept separate from plain /data experiments) ----------
 # json_cache        -> caches pre-serialized JSON bytes (from JSON_DB)
 # toon_cache        -> caches pre-serialized TOON bytes (from TOON_DB)
-# canonical_cache   -> caches ONLY TOON bytes (from TOON_DB); JSON reads are
-#                      converted from that cached TOON via decode_toon() on
-#                      every read (real conversion, on-demand, both structures)
+# canonical_cache   -> caches ONLY TOON bytes (from TOON_DB); JSON reads convert
+#                      from that cached TOON via decode_toon() on every read.
 
 _CACHE: dict = {}
 
@@ -179,7 +220,6 @@ def get_cached_data(mode: str = Query("json_cache"), format: str = Query("json")
             body = toon_bytes
             media = "text/toon"
         else:
-            # real conversion on read, now works for flat AND nested
             rows = decode_toon(toon_bytes.decode("utf-8"), structure)
             body = json.dumps(rows).encode("utf-8")
             media = "application/json"
