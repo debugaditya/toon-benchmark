@@ -81,7 +81,7 @@ def compress(body: bytes, encoding: str) -> bytes:
                 f"Brotli requested but not available on this server "
                 f"(import error: {_BROTLI_IMPORT_ERROR}). Check /health.")
         try:
-            return brotli.compress(body, quality=11)
+            return brotli.compress(body, quality=5)
         except Exception as e:
             raise RuntimeError(f"Brotli compression failed at runtime: {e}")
     return body
