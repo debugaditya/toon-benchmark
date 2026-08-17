@@ -1,28 +1,30 @@
 """
-Frontend / "requesting server" for the TOON vs JSON benchmark -- v3.
+Frontend / "requesting server" for the TOON vs JSON benchmark -- v4.
 
-Key methodology changes from v2 (see accompanying explanation for full rationale):
-  - Requests are INTERLEAVED in randomized order (not all-JSON-then-all-TOON),
-    using a seeded RNG so the exact order is reproducible and recorded in output.
-  - ONE persistent httpx.Client serves the entire comparison run (both formats),
-    not a fresh client per format.
-  - Percentiles (P50/P90/P95/P99) use Python's `statistics.quantiles` (method=
-    "inclusive", linear interpolation) instead of manual array-index math.
-  - Every individual request is recorded (timestamp, format, order position,
-    latency, serialization time, compression time, bytes, status) and returned
-    under "samples" -- not just aggregates.
-  - Configurable warm-up requests (excluded from stats) plus an explicit
-    cold-start figure (the first REAL measured request per format).
-  - Compression level is a first-class parameter, validated against what the
-    API actually used (echoed back in X-Level, displayed in the UI).
-  - Cross-database mode: force JSON output from TOON_DB, or TOON output from
-    JSON_DB, to test format/database independence.
-  - Experiment ID + full metadata on every run; raw samples exportable as
-    JSON/CSV from the browser.
-  - "Research Mode" auto-runs the full compression x level x size x structure
-    matrix. Repetition choices there are capped at 15 or 30 (not 100) because
-    the full matrix at high Brotli quality levels is already very slow on a
-    constrained free-tier CPU -- see the methodology notes in the UI.
+Changes from v3 (per the Final Improvement Requirements doc):
+  1. PAIRED randomization: each repetition is a pair (JSON,TOON) or
+     (TOON,JSON), direction chosen randomly per pair via a seeded RNG.
+     Keeps JSON/TOON measurements close in time while still preventing
+     systematic ordering bias -- replaces v3's fully independent shuffle.
+  2. Every sample now carries the full 4-phase server timing breakdown
+     (data_selection_ms, serialization_ms, utf8_encoding_ms, compression_ms,
+     server_processing_ms) plus a per-sample timestamp.
+  3. "cold_start_first_request_ms" renamed to "first_measured_request_ms"
+     (after warmup, it is not a true cold-start figure).
+  4. Cache experiments now strictly separate cache-miss from warm-cache:
+     clear -> 1 populate request (discarded, reported as cache_miss_latency_ms)
+     -> warmup (discarded) -> measured requests, each asserted X-Cache-Hit=true.
+     If any measured request is a miss, the experiment is marked failed rather
+     than silently reporting contaminated numbers.
+  5. Independent trials: repeat an entire measurement N times (different seeds)
+     to check reproducibility -- returned as a list, plus a combined pooled result.
+  6. Lightweight bootstrap confidence intervals (95%) for mean and P50 latency,
+     stdlib-only, skipped (reported as null) below a minimum sample size.
+  7. compression_ratio and size_reduction_percent reported per format, with
+     raw-size reduction and compressed-size reduction always kept distinct.
+  8. CSV export matches the exact column list from the requirements doc.
+  9. Payload sizes now include 100 and 100,000 (databases regenerated to
+     100,000 records to support this).
 
 Env vars:
     API_BASE_URL   -- base URL of the deployed api/ service
@@ -37,14 +39,15 @@ import httpx
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 
-API_BASE_URL = os.environ.get("API_BASE_URL", "http://localhost:9800")
+API_BASE_URL = os.environ.get("API_BASE_URL", "http://localhost:9950")
 if API_BASE_URL and not API_BASE_URL.startswith("http"):
     API_BASE_URL = f"https://{API_BASE_URL}"
 
-app = FastAPI(title="TOON vs JSON Benchmark Frontend v3")
+app = FastAPI(title="TOON vs JSON Benchmark Frontend v4")
 
 GZIP_LEVELS = [1, 5, 9]
 BROTLI_LEVELS = [1, 5, 9, 11]
+MIN_SAMPLES_FOR_CI = 10  # below this, CI is reported as null rather than misleadingly precise
 
 
 @app.get("/health")
@@ -72,13 +75,12 @@ def debug_connection():
 
 
 # ---------------------------------------------------------------------------
-# Statistics -- percentile method documented explicitly, per requirement #3.
+# Statistics
 # ---------------------------------------------------------------------------
 
 def compute_stats(values):
     """Percentile method: statistics.quantiles(values, n=100, method='inclusive'),
-    linear interpolation between the two nearest ranks. Requires >=2 samples for
-    quantiles; falls back to the single value otherwise."""
+    linear interpolation. Unchanged from v3 -- kept as the documented standard."""
     if not values:
         return {"n": 0, "mean": 0, "stdev": 0, "min": 0, "max": 0, "p50": 0, "p90": 0, "p95": 0, "p99": 0}
     n = len(values)
@@ -86,7 +88,7 @@ def compute_stats(values):
     sd = statistics.stdev(values) if n > 1 else 0.0
     lo, hi = min(values), max(values)
     if n >= 2:
-        q = statistics.quantiles(values, n=100, method="inclusive")  # 99 cut points
+        q = statistics.quantiles(values, n=100, method="inclusive")
 
         def qp(p):
             idx = max(0, min(len(q) - 1, p - 1))
@@ -96,6 +98,23 @@ def compute_stats(values):
         p50 = p90 = p95 = p99 = values[0]
     return {"n": n, "mean": round(mean, 3), "stdev": round(sd, 3), "min": round(lo, 3), "max": round(hi, 3),
             "p50": round(p50, 3), "p90": round(p90, 3), "p95": round(p95, 3), "p99": round(p99, 3)}
+
+
+def bootstrap_ci(values, stat_fn, seed, n_boot=1000, ci=0.95):
+    """Percentile bootstrap CI, stdlib-only. Returns None below MIN_SAMPLES_FOR_CI
+    rather than reporting a CI that would overclaim precision from a tiny sample."""
+    if len(values) < MIN_SAMPLES_FOR_CI:
+        return None
+    rnd = random.Random(seed)
+    n = len(values)
+    boots = []
+    for _ in range(n_boot):
+        resample = [values[rnd.randrange(n)] for _ in range(n)]
+        boots.append(stat_fn(resample))
+    boots.sort()
+    lo_idx = int((1 - ci) / 2 * n_boot)
+    hi_idx = int((1 + ci) / 2 * n_boot) - 1
+    return {"low": round(boots[lo_idx], 3), "high": round(boots[hi_idx], 3), "ci": ci, "n_boot": n_boot}
 
 
 def compute_diff(json_val, toon_val):
@@ -109,10 +128,32 @@ def compute_diff(json_val, toon_val):
             "improvement_percent": round(improvement_pct, 2)}
 
 
-def build_interleaved_order(repeats, seed):
-    order = ["json"] * repeats + ["toon"] * repeats
-    random.Random(seed).shuffle(order)
-    return order
+def size_metrics(raw_bytes, compressed_bytes):
+    ratio = (raw_bytes / compressed_bytes) if compressed_bytes else None
+    reduction_pct = ((1 - compressed_bytes / raw_bytes) * 100) if raw_bytes else None
+    return {"compression_ratio": round(ratio, 3) if ratio else None,
+            "size_reduction_percent": round(reduction_pct, 2) if reduction_pct is not None else None}
+
+
+# ---------------------------------------------------------------------------
+# Paired randomization (requirement #3)
+# ---------------------------------------------------------------------------
+
+def build_paired_order(repeats, seed):
+    """For each of `repeats` pairs, randomly choose (json,toon) or (toon,json)
+    as the pair direction. Returns the flat request sequence AND the pair
+    directions separately, both recorded in output for reproducibility."""
+    rnd = random.Random(seed)
+    order = []
+    pair_directions = []
+    for _ in range(repeats):
+        if rnd.random() < 0.5:
+            order += ["json", "toon"]
+            pair_directions.append("json_first")
+        else:
+            order += ["toon", "json"]
+            pair_directions.append("toon_first")
+    return order, pair_directions
 
 
 def _do_request(client: httpx.Client, fmt, structure, n, encoding, level, source_mode):
@@ -121,34 +162,39 @@ def _do_request(client: httpx.Client, fmt, structure, n, encoding, level, source
         params["level"] = level
     if source_mode == "cross":
         params["source"] = "toon_db" if fmt == "json" else "json_db"
-    # source_mode == "native" (default): omit "source", API applies auto-pairing
 
     t0 = time.perf_counter()
+    ts = datetime.now(timezone.utc).isoformat()
     try:
         r = client.get(f"{API_BASE_URL}/data", params=params)
         latency_ms = (time.perf_counter() - t0) * 1000
         return {
-            "format": fmt, "latency_ms": round(latency_ms, 3),
+            "timestamp": ts, "format": fmt, "latency_ms": round(latency_ms, 3),
+            "data_selection_ms": float(r.headers.get("x-data-selection-time-ms", 0)),
             "serialization_ms": float(r.headers.get("x-serialization-time-ms", 0)),
+            "utf8_encoding_ms": float(r.headers.get("x-utf8-encoding-time-ms", 0)),
             "compression_ms": float(r.headers.get("x-compression-time-ms", 0)),
+            "server_processing_ms": float(r.headers.get("x-server-processing-time-ms", 0)),
             "raw_bytes": int(r.headers.get("x-raw-bytes", 0)),
             "compressed_bytes": int(r.headers.get("x-compressed-bytes", 0)),
             "status_code": r.status_code,
-            "level_used": r.headers.get("x-level", ""),
+            "level": r.headers.get("x-level", ""),
+            "encoding": r.headers.get("x-encoding", encoding),
             "source_db": r.headers.get("x-source-db", ""),
         }
     except Exception as e:
         latency_ms = (time.perf_counter() - t0) * 1000
-        return {"format": fmt, "latency_ms": round(latency_ms, 3), "serialization_ms": 0,
-                "compression_ms": 0, "raw_bytes": 0, "compressed_bytes": 0,
-                "status_code": 0, "error": str(e), "level_used": "", "source_db": ""}
+        return {"timestamp": ts, "format": fmt, "latency_ms": round(latency_ms, 3),
+                "data_selection_ms": 0, "serialization_ms": 0, "utf8_encoding_ms": 0,
+                "compression_ms": 0, "server_processing_ms": 0, "raw_bytes": 0, "compressed_bytes": 0,
+                "status_code": 0, "error": str(e), "level": "", "encoding": encoding, "source_db": ""}
 
 
 def run_plain_case(structure, n, encoding, level, repeats, warmup, seed, source_mode):
-    order = build_interleaved_order(repeats, seed)
-    warmup_order = build_interleaved_order(warmup, seed + 1) if warmup > 0 else []
+    order, pair_directions = build_paired_order(repeats, seed)
+    warmup_order, _ = build_paired_order(warmup, seed + 1) if warmup > 0 else ([], [])
 
-    with httpx.Client(timeout=120) as client:  # ONE persistent client for the whole run
+    with httpx.Client(timeout=180) as client:  # ONE persistent client for the whole run
         for fmt in warmup_order:
             _do_request(client, fmt, structure, n, encoding, level, source_mode)  # discarded
 
@@ -165,18 +211,32 @@ def run_plain_case(structure, n, encoding, level, repeats, warmup, seed, source_
     results = {}
     for fmt in ["json", "toon"]:
         fs = by_fmt[fmt]
-        lat = [s["latency_ms"] for s in fs if s["status_code"] == 200]
-        ser = [s["serialization_ms"] for s in fs if s["status_code"] == 200]
-        comp = [s["compression_ms"] for s in fs if s["status_code"] == 200]
         ok = [s for s in fs if s["status_code"] == 200]
+        lat = [s["latency_ms"] for s in ok]
+        dsel = [s["data_selection_ms"] for s in ok]
+        ser = [s["serialization_ms"] for s in ok]
+        utf8 = [s["utf8_encoding_ms"] for s in ok]
+        comp = [s["compression_ms"] for s in ok]
+        sproc = [s["server_processing_ms"] for s in ok]
+
+        http_stats = compute_stats(lat)
+        http_stats["ci_mean_95"] = bootstrap_ci(lat, statistics.mean, seed) if lat else None
+        http_stats["ci_p50_95"] = bootstrap_ci(lat, statistics.median, seed + 1) if lat else None
+
+        raw_b = ok[-1]["raw_bytes"] if ok else 0
+        comp_b = ok[-1]["compressed_bytes"] if ok else 0
+
         results[fmt] = {
-            "raw_bytes": ok[-1]["raw_bytes"] if ok else 0,
-            "compressed_bytes": ok[-1]["compressed_bytes"] if ok else 0,
-            "level_used": ok[-1]["level_used"] if ok else "",
-            "http_latency": compute_stats(lat),
+            "raw_bytes": raw_b, "compressed_bytes": comp_b,
+            **size_metrics(raw_b, comp_b),
+            "level_used": ok[-1]["level"] if ok else "",
+            "http_latency": http_stats,
+            "data_selection": compute_stats(dsel),
             "serialization": compute_stats(ser),
+            "utf8_encoding": compute_stats(utf8),
             "compression": compute_stats(comp),
-            "cold_start_first_request_ms": fs[0]["latency_ms"] if fs else None,
+            "server_processing": compute_stats(sproc),
+            "first_measured_request_ms": fs[0]["latency_ms"] if fs else None,
             "error_count": len(fs) - len(ok),
         }
 
@@ -190,74 +250,147 @@ def run_plain_case(structure, n, encoding, level, repeats, warmup, seed, source_
         "compression_mean": compute_diff(results["json"]["compression"]["mean"], results["toon"]["compression"]["mean"]),
     }
 
-    return {"order": order, "warmup_order": warmup_order, "samples": samples,
-            "results": results, "comparison": comparison}
+    return {"order": order, "pair_directions": pair_directions, "warmup_order": warmup_order,
+            "samples": samples, "results": results, "comparison": comparison}
 
 
-def run_cache_case(mode, structure, n, repeats, seed):
+# ---------------------------------------------------------------------------
+# Cache experiments -- strict cache-miss / warm-cache separation (req #31)
+# ---------------------------------------------------------------------------
+
+def run_cache_case(mode, structure, n, repeats, warmup, seed):
     formats_to_test = ["json", "toon"] if mode == "canonical_cache" else \
                        (["json"] if mode == "json_cache" else ["toon"])
-    order = []
-    rnd = random.Random(seed)
-    for fmt in formats_to_test:
-        order += [fmt] * repeats
-    rnd.shuffle(order)
 
-    results = {}
-    samples = []
-    with httpx.Client(timeout=120) as client:
+    with httpx.Client(timeout=180) as client:
+        # 1. Clear cache
         client.post(f"{API_BASE_URL}/cache/clear")
+
+        # 2. ONE populate request (discarded from stats, reported as cache_miss_latency_ms).
+        #    For canonical_cache, populating with "toon" warms the shared canonical entry,
+        #    which both json and toon reads then hit.
+        populate_fmt = "toon" if mode == "canonical_cache" else formats_to_test[0]
+        t0 = time.perf_counter()
+        miss_r = client.get(f"{API_BASE_URL}/cache/data",
+                             params={"mode": mode, "format": populate_fmt, "n": n, "structure": structure})
+        cache_miss_latency_ms = round((time.perf_counter() - t0) * 1000, 3)
+        cache_miss_was_actually_miss = miss_r.headers.get("x-cache-hit") == "false"
+
+        # 3. Warmup (discarded) -- interleaved across formats_to_test if canonical_cache
+        rnd = random.Random(seed)
+        warmup_order = []
+        for fmt in formats_to_test:
+            warmup_order += [fmt] * warmup
+        rnd.shuffle(warmup_order)
+        for fmt in warmup_order:
+            client.get(f"{API_BASE_URL}/cache/data",
+                       params={"mode": mode, "format": fmt, "n": n, "structure": structure})
+
+        # 4. Measured requests -- EVERY one must be a cache hit. Fail the
+        #    experiment (not just warn) if any measured request is a miss.
+        order = []
+        for fmt in formats_to_test:
+            order += [fmt] * repeats
+        rnd.shuffle(order)
+
+        samples = []
+        any_miss = False
         for idx, fmt in enumerate(order):
             t0 = time.perf_counter()
             r = client.get(f"{API_BASE_URL}/cache/data",
                             params={"mode": mode, "format": fmt, "n": n, "structure": structure})
-            latency_ms = (time.perf_counter() - t0) * 1000
+            latency_ms = round((time.perf_counter() - t0) * 1000, 3)
+            is_hit = r.headers.get("x-cache-hit") == "true"
+            if not is_hit:
+                any_miss = True
             samples.append({
-                "request_index": idx, "format": fmt, "latency_ms": round(latency_ms, 3),
-                "cache_hit": r.headers.get("x-cache-hit") == "true",
-                "bytes": int(r.headers.get("x-bytes", 0)), "status_code": r.status_code,
+                "request_index": idx, "format": fmt, "latency_ms": latency_ms,
+                "cache_hit": is_hit, "bytes": int(r.headers.get("x-bytes", 0)), "status_code": r.status_code,
             })
 
+    if any_miss:
+        return {
+            "failed": True,
+            "reason": "One or more measured requests was a cache MISS (X-Cache-Hit=false). "
+                      "Per the warm-cache experimental protocol, all measured requests must be "
+                      "hits; a miss here indicates the cache was cleared, evicted, or never "
+                      "warmed correctly. Results are NOT reported to avoid contaminated numbers.",
+            "cache_miss_latency_ms": cache_miss_latency_ms,
+            "samples": samples,
+        }
+
+    results = {}
     for fmt in formats_to_test:
         fs = [s for s in samples if s["format"] == fmt]
         lat = [s["latency_ms"] for s in fs]
-        hits = sum(1 for s in fs if s["cache_hit"])
         results[fmt] = {
             "bytes": fs[-1]["bytes"] if fs else 0,
-            "cache_hit_rate_pct": round(100 * hits / len(fs), 1) if fs else 0,
+            "cache_hit_rate_pct": 100.0,  # guaranteed -- any_miss would have short-circuited above
             "latency": compute_stats(lat),
-            "cold_start_first_request_ms": fs[0]["latency_ms"] if fs else None,
         }
 
     if mode != "canonical_cache":
         only = formats_to_test[0]
         results = {only: results[only]}
 
-    return {"order": order, "samples": samples, "results": results}
+    return {
+        "failed": False,
+        "cache_miss_latency_ms": cache_miss_latency_ms,
+        "cache_miss_was_actually_miss": cache_miss_was_actually_miss,
+        "warmup_order": warmup_order, "order": order, "samples": samples, "results": results,
+    }
 
 
 @app.get("/run")
 def run(case_type: str = Query("plain"), structure: str = Query("flat"), n: int = Query(1000),
         encoding: str = Query("identity"), level: int = Query(None), mode: str = Query("json_cache"),
         repeats: int = Query(15), warmup: int = Query(3), seed: int = Query(42),
-        source_mode: str = Query("native")):
-    experiment_id = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{structure}_{n}_{encoding}{level or ''}_{repeats}"
+        source_mode: str = Query("native"), trials: int = Query(1)):
+    trials = max(1, min(trials, 5))  # sane cap -- not in the spec, but unbounded trials via one
+                                      # HTTP call risks the same timeout problem research mode has
     timestamp = datetime.now(timezone.utc).isoformat()
+    base_experiment_id = f"{timestamp.replace(':', '').replace('-', '').split('.')[0]}Z_{structure}_{n}_{encoding}{level or ''}_{repeats}"
 
     try:
         if case_type == "cache":
-            data = run_cache_case(mode, structure, n, repeats, seed)
-        else:
-            data = run_plain_case(structure, n, encoding, level, repeats, warmup, seed, source_mode)
+            data = run_cache_case(mode, structure, n, repeats, warmup, seed)
+            return {
+                "experiment_id": base_experiment_id, "timestamp": timestamp,
+                "case_type": case_type, "structure": structure, "n": n, "mode": mode,
+                "repeats": repeats, "warmup": warmup, "seed": seed,
+                "api_base_url": API_BASE_URL, "preliminary": repeats < 30,
+                **data,
+            }
+
+        trial_results = []
+        for t in range(trials):
+            trial_seed = seed + t * 1000  # distinct, reproducible seed per trial
+            trial_data = run_plain_case(structure, n, encoding, level, repeats, warmup, trial_seed, source_mode)
+            trial_results.append({"trial_index": t, "seed": trial_seed, **trial_data})
+
+        # Pooled/combined view across trials, for a quick reproducibility check
+        combined = None
+        if trials > 1:
+            pooled_json = [s["latency_ms"] for tr in trial_results for s in tr["samples"]
+                           if s["format"] == "json" and s["status_code"] == 200]
+            pooled_toon = [s["latency_ms"] for tr in trial_results for s in tr["samples"]
+                           if s["format"] == "toon" and s["status_code"] == 200]
+            combined = {"json_http_latency": compute_stats(pooled_json),
+                        "toon_http_latency": compute_stats(pooled_toon)}
 
         return {
-            "experiment_id": experiment_id, "timestamp": timestamp,
+            "experiment_id": base_experiment_id, "timestamp": timestamp,
             "case_type": case_type, "structure": structure, "n": n, "encoding": encoding, "level": level,
-            "mode": mode, "repeats": repeats, "warmup": warmup, "seed": seed, "source_mode": source_mode,
+            "repeats": repeats, "warmup": warmup, "seed": seed, "source_mode": source_mode, "trials": trials,
             "api_base_url": API_BASE_URL,
             "percentile_method": "statistics.quantiles(n=100, method='inclusive'), linear interpolation",
+            "ci_method": f"percentile bootstrap, 1000 resamples, 95% CI, skipped below n={MIN_SAMPLES_FOR_CI}",
             "preliminary": repeats < 30,
-            **data,
+            "trial_results": trial_results,
+            "combined_across_trials": combined,
+            # top-level convenience mirrors of trial 0, so single-trial callers (the default)
+            # don't need to dig into trial_results[0] for the common case
+            **{k: v for k, v in trial_results[0].items() if k not in ("trial_index", "seed")},
         }
     except httpx.ConnectError as e:
         return {"error": "connect_error",
@@ -271,12 +404,13 @@ def run(case_type: str = Query("plain"), structure: str = Query("flat"), n: int 
 
 @app.get("/run-research")
 def run_research(repeats: int = Query(15), warmup: int = Query(2), seed: int = Query(42)):
-    """Auto-runs the full matrix: structure x n x (identity, gzip@1/5/9, brotli@1/5/9/11).
-    WARNING: this can take a very long time -- Brotli at quality 11 on a
-    constrained CPU can take 10-30+ seconds PER REQUEST at n=10000, and this
-    runs many combinations sequentially. Consider starting with a subset."""
+    """Auto-runs the full matrix. Per requirement #18, this is explicitly an
+    EXPLORATION tool, not the recommended path for final data collection --
+    run individual cells via /run for that, so each cell's raw samples can be
+    exported and saved as it completes, rather than risking one giant HTTP
+    call timing out and losing everything."""
     if repeats not in (15, 30):
-        repeats = 15  # research mode intentionally caps repeats at 15 or 30
+        repeats = 15
 
     matrix = []
     for structure in ["flat", "nested"]:
@@ -298,7 +432,9 @@ def run_research(repeats: int = Query(15), warmup: int = Query(2), seed: int = Q
                                  "error": str(e)})
 
     return {"research_run_id": run_id, "matrix_size": len(matrix), "repeats": repeats,
-            "warmup": warmup, "seed": seed, "cases": all_results}
+            "warmup": warmup, "seed": seed, "cases": all_results,
+            "note": "Exploration tool. For final research data, run cells individually via /run "
+                    "and export each cell's samples as it completes (requirement #18)."}
 
 
 INDEX_HTML = """
@@ -308,7 +444,7 @@ INDEX_HTML = """
 <meta charset="utf-8">
 <title>TOON vs JSON Benchmark</title>
 <style>
-  body { font-family: -apple-system, sans-serif; max-width: 1000px; margin: 40px auto; padding: 0 20px; color: #222; }
+  body { font-family: -apple-system, sans-serif; max-width: 1050px; margin: 40px auto; padding: 0 20px; color: #222; }
   h1 { font-size: 22px; }
   .controls { display: flex; gap: 10px; flex-wrap: wrap; align-items: end; margin: 20px 0; }
   .field { display: flex; flex-direction: column; gap: 4px; }
@@ -320,7 +456,7 @@ INDEX_HTML = """
   th, td { border: 1px solid #ddd; padding: 5px 8px; text-align: center; }
   th { background: #f5f5f5; }
   #status { color: #666; font-size: 13px; margin-top: 10px; }
-  .warn { color: #a33; }
+  .warn { color: #a33; font-weight: 600; }
   .note { color: #888; font-size: 12px; margin: 6px 0; }
   details { margin: 14px 0; font-size: 13px; background: #fafafa; padding: 10px; border-radius: 6px; }
   summary { cursor: pointer; font-weight: 600; }
@@ -328,21 +464,25 @@ INDEX_HTML = """
   .bar { background: #444; width: 6px; }
   .bar.toon { background: #c60; }
   .export-btns { margin-top: 10px; display: flex; gap: 8px; }
+  .fail-box { background: #fee; border: 1px solid #c33; padding: 10px; border-radius: 6px; }
 </style>
 </head>
 <body>
 <h1>TOON vs JSON Benchmark</h1>
-<p style="color:#666">Requests are fired server-side against the API service, interleaved in randomized order (seeded, reproducible), using one persistent connection for the whole run.</p>
+<p style="color:#666">Requests are fired server-side against the API service, in randomized PAIRS (JSON&rarr;TOON or TOON&rarr;JSON per pair, direction seeded), using one persistent connection for the whole run.</p>
 
 <details>
 <summary>Methodology / terminology</summary>
-<p><b>Raw bytes</b>: size after serialization, before compression.</p>
-<p><b>Compressed bytes</b>: size after gzip/Brotli at the selected level.</p>
-<p><b>Serialization time</b>: time to build the JSON/TOON text from the in-memory data.</p>
-<p><b>Compression time</b>: time to compress that text with gzip/Brotli.</p>
-<p><b>HTTP latency</b> ("end-to-end request latency"): client-observed time from just before the request is sent to just after the response is received -- includes network, server processing (serialization + compression), and response transmission. This is NOT pure network latency.</p>
-<p><b>P50/P90/P95/P99</b>: percentiles via statistics.quantiles(method="inclusive"), linear interpolation. With small sample counts (under ~30), especially P99, treat these as preliminary, not statistically robust.</p>
-<p><b>Cross-database mode</b>: forces the JSON-format request to read from the TOON database (or vice versa) to check the two databases are truly interchangeable -- results should be byte-identical to native mode if the data is equivalent.</p>
+<p><b>Data selection</b>: time to slice rows = db[structure][:n] from the in-memory database.</p>
+<p><b>Serialization</b>: time to build the JSON/TOON text from those rows.</p>
+<p><b>UTF-8 encoding</b>: time to encode that text to bytes.</p>
+<p><b>Compression</b>: time to gzip/Brotli those bytes at the selected level.</p>
+<p><b>Server processing</b> = the sum of the four phases above. Explicitly excludes network transmission.</p>
+<p><b>HTTP latency</b> ("client-observed end-to-end request latency"): time from just before the request is sent to just after the response is received. Includes network + all server phases + response transmission. This is NOT pure network latency, and network time is never inferred by subtraction.</p>
+<p><b>P50/P90/P95/P99</b>: statistics.quantiles(method="inclusive"), linear interpolation.</p>
+<p><b>Confidence intervals</b>: 95% percentile bootstrap (1000 resamples), only computed at n&ge;10 samples -- shown as null otherwise rather than a misleadingly precise interval.</p>
+<p><b>Cache-miss vs warm-cache</b>: cache is cleared, one populate request is discarded and timed separately (cache_miss_latency_ms), then warmup requests are discarded, then ALL measured requests are asserted to be cache hits -- the experiment fails outright (not silently) if any measured request is a miss.</p>
+<p><b>Cross-database mode</b>: forces JSON output from TOON_DB (or vice versa) as a secondary robustness check -- kept fully separate from primary native-pairing results.</p>
 </details>
 
 <div class="controls">
@@ -351,7 +491,7 @@ INDEX_HTML = """
     <select id="caseType" onchange="toggleFields()">
       <option value="plain">Format x compression</option>
       <option value="cache">Cache layer</option>
-      <option value="research">Research mode (full matrix)</option>
+      <option value="research">Research mode (exploration only)</option>
     </select>
   </div>
   <div class="field" id="structureField">
@@ -360,7 +500,7 @@ INDEX_HTML = """
   </div>
   <div class="field" id="nField">
     <label>n (records)</label>
-    <select id="n"><option value="1000">1000</option><option value="10000" selected>10000</option></select>
+    <select id="n"><option value="100">100</option><option value="1000">1000</option><option value="10000" selected>10000</option><option value="100000">100000</option></select>
   </div>
   <div class="field" id="encodingField">
     <label>Compression</label>
@@ -377,8 +517,8 @@ INDEX_HTML = """
   <div class="field" id="sourceModeField">
     <label>Database source</label>
     <select id="sourceMode">
-      <option value="native">Native (json&rarr;JSON_DB, toon&rarr;TOON_DB)</option>
-      <option value="cross">Cross (json&rarr;TOON_DB, toon&rarr;JSON_DB)</option>
+      <option value="native">Native (primary)</option>
+      <option value="cross">Cross (secondary/robustness)</option>
     </select>
   </div>
   <div class="field" id="modeField" style="display:none">
@@ -399,8 +539,12 @@ INDEX_HTML = """
       <option value="5">5 (quick test)</option>
       <option value="15" selected>15</option>
       <option value="30">30</option>
-      <option value="100">100 (research)</option>
+      <option value="100">100 (final research)</option>
     </select>
+  </div>
+  <div class="field" id="trialsField">
+    <label>Independent trials</label>
+    <select id="trials"><option value="1" selected>1</option><option value="3">3</option></select>
   </div>
   <div class="field" id="researchRepeatsField" style="display:none">
     <label>Repeats (research mode)</label>
@@ -413,7 +557,7 @@ INDEX_HTML = """
   <button id="runBtn" onclick="runCase()">Run</button>
 </div>
 
-<p class="note" id="researchWarning" style="display:none">Research mode runs the full structure x size x compression x level matrix sequentially. High Brotli levels at n=10000 can take many seconds PER REQUEST -- this can take a long time and may exceed platform request timeouts. Consider running smaller subsets manually first.</p>
+<p class="note" id="researchWarning" style="display:none">Research mode is an EXPLORATION tool, not for final data collection -- one giant HTTP call risks timing out and losing everything. For final research data, run cells individually (Format x compression, repeats=100) and export each cell's CSV/JSON as it completes.</p>
 
 <div id="status"></div>
 <div id="resultsArea"></div>
@@ -449,6 +593,7 @@ function toggleFields() {
   document.getElementById('structureField').style.display = isResearch ? 'none' : 'flex';
   document.getElementById('warmupField').style.display = isResearch ? 'none' : 'flex';
   document.getElementById('repeatsField').style.display = isResearch ? 'none' : 'flex';
+  document.getElementById('trialsField').style.display = (isCache || isResearch) ? 'none' : 'flex';
   document.getElementById('researchRepeatsField').style.display = isResearch ? 'flex' : 'none';
   document.getElementById('researchWarning').style.display = isResearch ? 'block' : 'none';
 }
@@ -458,7 +603,7 @@ async function runCase() {
   const status = document.getElementById('status');
   const ct = document.getElementById('caseType').value;
   btn.disabled = true;
-  status.textContent = 'Running... (this can take a while, especially research mode or high Brotli levels)';
+  status.textContent = 'Running...';
   document.getElementById('resultsArea').innerHTML = '';
 
   let url;
@@ -479,6 +624,7 @@ async function runCase() {
       warmup: document.getElementById('warmup').value,
       seed: document.getElementById('seed').value,
       source_mode: document.getElementById('sourceMode').value,
+      trials: document.getElementById('trials').value,
     });
     const lvl = document.getElementById('level').value;
     if (lvl) params.set('level', lvl);
@@ -491,13 +637,17 @@ async function runCase() {
     lastData = data;
     if (data.error) {
       status.textContent = 'Error (' + data.error + ')';
-      document.getElementById('resultsArea').innerHTML = '<p style="color:#b00">' + data.message + '</p>';
+      document.getElementById('resultsArea').innerHTML = '<p class="warn">' + data.message + '</p>';
     } else if (data.research_run_id) {
       renderResearch(data);
-      status.textContent = 'Done. Research run: ' + data.research_run_id;
+      status.textContent = 'Done. ' + data.note;
+    } else if (data.failed) {
+      status.textContent = 'Experiment FAILED';
+      document.getElementById('resultsArea').innerHTML =
+        '<div class="fail-box"><b>Cache experiment failed:</b> ' + data.reason + '</div>';
     } else {
       render(data);
-      status.textContent = 'Done. Experiment ID: ' + data.experiment_id + (data.preliminary ? ' (PRELIMINARY -- low repeat count)' : '');
+      status.textContent = 'Done. Experiment ID: ' + data.experiment_id + (data.preliminary ? ' (PRELIMINARY -- repeats<30)' : '');
     }
   } catch (e) {
     status.textContent = 'Error: ' + e;
@@ -519,56 +669,72 @@ function histogramHtml(samples, key) {
   return html;
 }
 
-function statsRow(label, jsonStats, toonStats, diff) {
-  return `<tr><td>${label}</td><td>${jsonStats}</td><td>${toonStats}</td>` +
+function statsRow(label, jsonV, toonV, diff) {
+  return `<tr><td>${label}</td><td>${jsonV}</td><td>${toonV}</td>` +
          `<td>${diff ? diff.absolute_difference : ''}</td>` +
          `<td>${diff ? diff.improvement_percent + '%' : ''}</td></tr>`;
 }
 
+function ciText(ci) {
+  if (!ci) return 'n/a (sample too small)';
+  return `[${ci.low}, ${ci.high}] (${Math.round(ci.ci*100)}%)`;
+}
+
+function renderOneTrial(data, r, c) {
+  let html = '<table><tr><th>Metric</th><th>JSON</th><th>TOON</th><th>Abs diff (TOON-JSON)</th><th>Improvement (TOON vs JSON)</th></tr>';
+  html += statsRow('raw_bytes', r.json.raw_bytes, r.toon.raw_bytes, c.raw_bytes);
+  html += statsRow('compressed_bytes', r.json.compressed_bytes, r.toon.compressed_bytes, c.compressed_bytes);
+  html += statsRow('compression_ratio', r.json.compression_ratio, r.toon.compression_ratio, null);
+  html += statsRow('size_reduction_percent', r.json.size_reduction_percent, r.toon.size_reduction_percent, null);
+  html += statsRow('level_used', r.json.level_used, r.toon.level_used, null);
+  html += statsRow('first_measured_request_ms', r.json.first_measured_request_ms, r.toon.first_measured_request_ms, null);
+  html += statsRow('data_selection mean_ms', r.json.data_selection.mean, r.toon.data_selection.mean, null);
+  html += statsRow('serialization mean_ms', r.json.serialization.mean, r.toon.serialization.mean, c.serialization_mean);
+  html += statsRow('utf8_encoding mean_ms', r.json.utf8_encoding.mean, r.toon.utf8_encoding.mean, null);
+  html += statsRow('compression mean_ms', r.json.compression.mean, r.toon.compression.mean, c.compression_mean);
+  html += statsRow('server_processing mean_ms', r.json.server_processing.mean, r.toon.server_processing.mean, null);
+  html += statsRow('http_latency MEAN_ms', r.json.http_latency.mean, r.toon.http_latency.mean, c.http_latency_mean);
+  html += statsRow('http_latency p50_ms', r.json.http_latency.p50, r.toon.http_latency.p50, c.http_latency_p50);
+  html += statsRow('http_latency p90_ms', r.json.http_latency.p90, r.toon.http_latency.p90, null);
+  html += statsRow('http_latency p95_ms', r.json.http_latency.p95, r.toon.http_latency.p95, c.http_latency_p95);
+  html += statsRow('http_latency p99_ms', r.json.http_latency.p99, r.toon.http_latency.p99, null);
+  html += statsRow('http_latency stdev_ms', r.json.http_latency.stdev, r.toon.http_latency.stdev, null);
+  html += statsRow('http_latency min/max_ms', r.json.http_latency.min + ' / ' + r.json.http_latency.max,
+                    r.toon.http_latency.min + ' / ' + r.toon.http_latency.max, null);
+  html += statsRow('95% CI (mean)', ciText(r.json.http_latency.ci_mean_95), ciText(r.toon.http_latency.ci_mean_95), null);
+  html += statsRow('95% CI (p50)', ciText(r.json.http_latency.ci_p50_95), ciText(r.toon.http_latency.ci_p50_95), null);
+  html += statsRow('sample count', r.json.http_latency.n, r.toon.http_latency.n, null);
+  html += statsRow('errors', r.json.error_count, r.toon.error_count, null);
+  html += '</table>';
+  return html;
+}
+
 function render(data) {
-  const r = data.results;
-  const formatsPresent = Object.keys(r);
-  let html = `<p><b>Case:</b> ${data.case_type}, structure=${data.structure}, n=${data.n}, ` +
-             `${data.case_type === 'cache' ? 'mode=' + data.mode : 'encoding=' + data.encoding + (data.level ? ' level=' + data.level : '')}, ` +
-             `repeats=${data.repeats}, warmup=${data.warmup || 0}, seed=${data.seed}, source=${data.source_mode || 'n/a'}</p>`;
-  html += `<p class="note">Percentile method: ${data.percentile_method}</p>`;
+  let html = `<p><b>Case:</b> structure=${data.structure}, n=${data.n}, encoding=${data.encoding}${data.level ? ' level='+data.level : ''}, ` +
+             `repeats=${data.repeats}, warmup=${data.warmup}, seed=${data.seed}, source=${data.source_mode}, trials=${data.trials}</p>`;
+  html += `<p class="note">Percentiles: ${data.percentile_method}<br>CI: ${data.ci_method}</p>`;
   if (data.preliminary) html += `<p class="warn">PRELIMINARY: repeats &lt; 30 -- percentiles (especially P99) may not be statistically meaningful.</p>`;
 
-  if (formatsPresent.length === 1) {
-    const only = formatsPresent[0];
-    const s = r[only];
-    html += `<p>Single-format cache (${only.toUpperCase()} only) -- cold vs warm behavior.</p>`;
-    html += '<table><tr><th>Metric</th><th>Value</th></tr>';
-    html += `<tr><td>bytes</td><td>${s.bytes}</td></tr>`;
-    html += `<tr><td>cache_hit_rate_pct</td><td>${s.cache_hit_rate_pct}</td></tr>`;
-    html += `<tr><td>first_request_ms (cold start)</td><td>${s.cold_start_first_request_ms}</td></tr>`;
-    html += `<tr><td>mean latency_ms</td><td>${s.latency.mean}</td></tr>`;
-    html += `<tr><td>p50 latency_ms</td><td>${s.latency.p50}</td></tr>`;
-    html += `<tr><td>p95 latency_ms</td><td>${s.latency.p95}</td></tr>`;
-    html += '</table>';
-  } else if (r.json && r.json.http_latency) {
-    const c = data.comparison || {};
-    html += '<table><tr><th>Metric</th><th>JSON</th><th>TOON</th><th>Abs diff (TOON-JSON)</th><th>Improvement (TOON vs JSON)</th></tr>';
-    html += statsRow('raw_bytes', r.json.raw_bytes, r.toon.raw_bytes, c.raw_bytes);
-    html += statsRow('compressed_bytes', r.json.compressed_bytes, r.toon.compressed_bytes, c.compressed_bytes);
-    html += statsRow('level_used', r.json.level_used, r.toon.level_used, null);
-    html += statsRow('cold_start_first_request_ms', r.json.cold_start_first_request_ms, r.toon.cold_start_first_request_ms, null);
-    html += statsRow('serialization mean_ms', r.json.serialization.mean, r.toon.serialization.mean, c.serialization_mean);
-    html += statsRow('compression mean_ms', r.json.compression.mean, r.toon.compression.mean, c.compression_mean);
-    html += statsRow('http_latency MEAN_ms', r.json.http_latency.mean, r.toon.http_latency.mean, c.http_latency_mean);
-    html += statsRow('http_latency p50_ms', r.json.http_latency.p50, r.toon.http_latency.p50, c.http_latency_p50);
-    html += statsRow('http_latency p90_ms', r.json.http_latency.p90, r.toon.http_latency.p90, null);
-    html += statsRow('http_latency p95_ms', r.json.http_latency.p95, r.toon.http_latency.p95, c.http_latency_p95);
-    html += statsRow('http_latency p99_ms', r.json.http_latency.p99, r.toon.http_latency.p99, null);
-    html += statsRow('http_latency stdev_ms', r.json.http_latency.stdev, r.toon.http_latency.stdev, null);
-    html += statsRow('http_latency min/max_ms', r.json.http_latency.min + ' / ' + r.json.http_latency.max,
-                      r.toon.http_latency.min + ' / ' + r.toon.http_latency.max, null);
-    html += statsRow('sample count', r.json.http_latency.n, r.toon.http_latency.n, null);
-    html += statsRow('errors', r.json.error_count, r.toon.error_count, null);
-    html += '</table>';
-    html += '<p class="note">Latency distribution (each bar = one request, JSON above / TOON below, taller = slower):</p>';
+  if (data.trials > 1) {
+    html += `<p><b>${data.trials} independent trials</b> (reproducibility check):</p>`;
+    for (const tr of data.trial_results) {
+      html += `<details style="margin-bottom:8px"><summary>Trial ${tr.trial_index} (seed=${tr.seed})</summary>`;
+      html += renderOneTrial(data, tr.results, tr.comparison);
+      html += `<p class="note">Order (pairs): ${tr.pair_directions.join(', ')}</p></details>`;
+    }
+    if (data.combined_across_trials) {
+      html += `<p><b>Pooled across all trials:</b></p>`;
+      html += `<table><tr><th></th><th>JSON http_latency</th><th>TOON http_latency</th></tr>`;
+      const cj = data.combined_across_trials.json_http_latency, ct2 = data.combined_across_trials.toon_http_latency;
+      html += `<tr><td>mean</td><td>${cj.mean}</td><td>${ct2.mean}</td></tr>`;
+      html += `<tr><td>p50</td><td>${cj.p50}</td><td>${ct2.p50}</td></tr>`;
+      html += `<tr><td>n</td><td>${cj.n}</td><td>${ct2.n}</td></tr></table>`;
+    }
+  } else {
+    html += renderOneTrial(data, data.results, data.comparison);
+    html += '<p class="note">Latency distribution (each bar = one request):</p>';
     html += histogramHtml(data.samples, 'latency_ms');
-    html += `<p class="note">Request order (interleaved, seed=${data.seed}): ${data.order.join(', ')}</p>`;
+    html += `<p class="note">Pair directions (seed=${data.seed}): ${data.pair_directions.join(', ')}</p>`;
   }
 
   html += `<div class="export-btns">
@@ -580,6 +746,7 @@ function render(data) {
 
 function renderResearch(data) {
   let html = `<p><b>Research run:</b> ${data.research_run_id} -- ${data.matrix_size} cases, repeats=${data.repeats}, warmup=${data.warmup}</p>`;
+  html += `<p class="warn">${data.note}</p>`;
   html += '<table><tr><th>Structure</th><th>n</th><th>Encoding</th><th>Level</th>' +
           '<th>JSON compressed_bytes</th><th>TOON compressed_bytes</th>' +
           '<th>JSON p50 ms</th><th>TOON p50 ms</th></tr>';
@@ -609,11 +776,26 @@ function exportJson() {
 }
 
 function exportCsv() {
-  if (!lastData || !lastData.samples) return;
-  const cols = ['request_index','format','latency_ms','serialization_ms','compression_ms','raw_bytes','compressed_bytes','status_code','level_used','source_db'];
+  if (!lastData) return;
+  const cols = ['trial','experiment_id','timestamp','structure','n','format','encoding','level',
+                'request_index','data_selection_ms','serialization_ms','utf8_encoding_ms',
+                'compression_ms','server_processing_ms','http_latency_ms','raw_bytes',
+                'compressed_bytes','status_code','source_db'];
   let csv = cols.join(',') + '\\n';
-  for (const s of lastData.samples) {
-    csv += cols.map(c => s[c] !== undefined ? s[c] : '').join(',') + '\\n';
+  const trialList = lastData.trial_results || [{trial_index: 0, samples: lastData.samples}];
+  for (const tr of trialList) {
+    for (const s of tr.samples) {
+      const row = {
+        trial: tr.trial_index, experiment_id: lastData.experiment_id, timestamp: s.timestamp,
+        structure: lastData.structure, n: lastData.n, format: s.format, encoding: s.encoding,
+        level: s.level, request_index: s.request_index, data_selection_ms: s.data_selection_ms,
+        serialization_ms: s.serialization_ms, utf8_encoding_ms: s.utf8_encoding_ms,
+        compression_ms: s.compression_ms, server_processing_ms: s.server_processing_ms,
+        http_latency_ms: s.latency_ms, raw_bytes: s.raw_bytes, compressed_bytes: s.compressed_bytes,
+        status_code: s.status_code, source_db: s.source_db,
+      };
+      csv += cols.map(c => row[c] !== undefined ? row[c] : '').join(',') + '\\n';
+    }
   }
   const blob = new Blob([csv], {type: 'text/csv'});
   const a = document.createElement('a');

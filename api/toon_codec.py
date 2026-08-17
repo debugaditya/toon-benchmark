@@ -24,6 +24,8 @@ files back into Python objects at server startup so requests can slice by n
 and re-encode without ever touching the JSON database file.
 """
 
+__version__ = "1.0.0"
+
 
 def _esc(v):
     s = str(v)
