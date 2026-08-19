@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .env
+api/toon_cpp/build/
+api/toon_cpp/*.so
+api/toon_cpp/*.egg-info/

@@ -5,7 +5,7 @@ services:
     plan: free
     region: singapore   # Singapore
     rootDir: api
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install -r requirements.txt && pip install ./toon_cpp
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
 
