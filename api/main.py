@@ -97,17 +97,22 @@ def _validate_db_equivalence():
     print(f"Startup validation OK (official codec): JSON_DB and TOON_DB are semantically equal "
           f"({len(JSON_DB['flat']):,} flat, {len(JSON_DB['nested']):,} nested records).")
     if HAVE_CPP_TOON:
-        # Extra check specifically for the C++ codec, since it's a hand-written
-        # reimplementation -- verify it's byte-identical to the official
-        # encoder on the actual bundled flat dataset before trusting it live.
-        cpp_out = toon_cpp.encode_flat(JSON_DB["flat"])
-        official_out = toon_format.encode(JSON_DB["flat"])
-        if cpp_out != official_out:
-            print("FATAL: toon_cpp.encode_flat() output does not match toon_format.encode() "
-                  "byte-for-byte on the bundled flat dataset. Aborting startup rather than "
-                  "serving a possibly-incorrect C++ codec.", file=sys.stderr)
-            sys.exit(1)
-        print("Startup validation OK (cpp codec): byte-identical to official encoder on full flat dataset.")
+        for structure in ("flat", "nested"):
+            cpp_out = toon_cpp.encode_toon(JSON_DB[structure])
+            official_out = toon_format.encode(JSON_DB[structure])
+
+            if cpp_out != official_out:
+                print(
+                    f"FATAL: toon_cpp.encode_toon() output does not match "
+                    f"official encoder for {structure} dataset.",
+                    file=sys.stderr
+                )
+                sys.exit(1)
+
+        print(
+            "Startup validation OK (cpp codec): "
+            "byte-identical to official encoder on flat and nested datasets."
+        )
 
 
 _validate_db_equivalence()
@@ -146,20 +151,20 @@ def compress(body: bytes, encoding: str, level: int | None):
 def toon_encode(rows, structure: str, codec: str) -> str:
     if codec == "custom":
         return toon_codec.encode_toon(rows, structure)
+
     if codec == "cpp":
-        if structure != "flat":
-            raise HTTPException(status_code=400,
-                                 detail="codec=cpp only supports structure=flat -- the C++ "
-                                        "implementation covers the tabular case only; use "
-                                        "codec=official for nested structures.")
         if not HAVE_CPP_TOON:
-            raise HTTPException(status_code=503,
-                                 detail=f"codec=cpp requested but the C++ extension is not built "
-                                        f"on this server (import error: {_CPP_TOON_IMPORT_ERROR}). "
-                                        f"Check /health -- falling back to codec=official is "
-                                        f"recommended when this is unavailable.")
-        return toon_cpp.encode_flat(rows)
-    return toon_format.encode(rows)  # official -- introspects the data, no structure param needed
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"codec=cpp requested but the C++ extension is not built "
+                    f"on this server (import error: {_CPP_TOON_IMPORT_ERROR})."
+                )
+            )
+
+        return toon_cpp.encode_toon(rows)
+
+    return toon_format.encode(rows)
 
 
 @app.get("/health")

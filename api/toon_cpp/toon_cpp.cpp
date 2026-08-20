@@ -1,17 +1,21 @@
-// C++ implementation of the flat/tabular TOON encode/decode path.
-// Optimized version: preserves the existing flat TOON behavior while
-// minimizing Python-object lookups, temporary strings, and stream overhead
-// in the encoder.
+// Recursive C++ TOON encoder for JSON-shaped Python data.
 //
-// Scope: FLAT/uniform-record arrays only.
-// Nested structures continue to use the official pure-Python codec.
+// API:
+//   toon_cpp.encode_toon(value)  -> str
+//   toon_cpp.encode_flat(rows)   -> str (kept as compatibility alias)
 //
-// The encoder keeps the same public API:
-//     toon_cpp.encode_flat(rows)
-//     toon_cpp.decode_flat(text)
+// The encoder recursively handles:
+//   - primitives
+//   - objects/dicts
+//   - primitive arrays (inline)
+//   - arrays of uniform objects (tabular)
+//   - arrays of nested-uniform objects (nested field groups)
+//   - mixed/non-uniform arrays (list form)
+//   - nested arrays/objects
 //
-// Important: TOON output semantics are intentionally kept equivalent to the
-// previous implementation. The optimization is implementation-level only.
+// Default delimiter is comma. Indentation is two spaces.
+// This targets TOON spec 4.1 behavior for the JSON-shaped values used by the
+// benchmark. The existing decode_flat API is intentionally retained separately.
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -20,125 +24,102 @@
 #include <sstream>
 #include <cctype>
 #include <stdexcept>
+#include <algorithm>
+#include <functional>
+#include <cstdio>
 #include <Python.h>
 
 namespace py = pybind11;
 
-// ---------- helpers ----------
+static constexpr char DELIM = ',';
+static constexpr int INDENT = 2;
+
+// -----------------------------------------------------------------------------
+// Scalar helpers
+// -----------------------------------------------------------------------------
 
 static bool looks_like_number(const std::string& s) {
     if (s.empty()) return false;
-
     size_t i = 0;
     if (s[i] == '-' || s[i] == '+') ++i;
     if (i >= s.size()) return false;
 
-    bool seen_digit = false;
-    bool seen_dot = false;
-
+    bool digit = false, dot = false;
     for (; i < s.size(); ++i) {
-        const unsigned char c = static_cast<unsigned char>(s[i]);
-
-        if (std::isdigit(c)) {
-            seen_digit = true;
-            continue;
-        }
-
-        if (s[i] == '.' && !seen_dot) {
-            seen_dot = true;
-            continue;
-        }
-
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        if (std::isdigit(c)) { digit = true; continue; }
+        if (s[i] == '.' && !dot) { dot = true; continue; }
         return false;
     }
-
-    return seen_digit;
+    return digit;
 }
 
 static bool needs_quoting(const std::string& s) {
     if (s.empty()) return true;
-
     if (s.front() == ' ' || s.back() == ' ') return true;
-
     if (s == "true" || s == "false" || s == "null") return true;
-
     if (looks_like_number(s)) return true;
-
     for (char c : s) {
-        if (c == ',' || c == '"' || c == '\\' || c == '\n')
-            return true;
+        if (c == DELIM || c == '"' || c == '\\' || c == '\n' ||
+            c == '\r' || c == '\t') return true;
+        if (static_cast<unsigned char>(c) < 0x20) return true;
     }
-
     return false;
 }
 
-// Append a Python string using exactly the same quoting/escaping rules as
-// the previous implementation, but without creating temporary strings.
-static inline void append_string(std::string& out, const std::string& s) {
-    if (!needs_quoting(s)) {
-        out.append(s);
-        return;
-    }
-
+static void append_quoted(std::string& out, const std::string& s) {
     out.push_back('"');
-
     for (char c : s) {
         switch (c) {
-            case '\\':
-                out.append("\\\\");
-                break;
-            case '"':
-                out.append("\\\"");
-                break;
-            case '\n':
-                out.append("\\n");
-                break;
+            case '\\': out.append("\\\\"); break;
+            case '"':  out.append("\\\""); break;
+            case '\n': out.append("\\n"); break;
+            case '\r': out.append("\\r"); break;
+            case '\t': out.append("\\t"); break;
             default:
-                out.push_back(c);
-                break;
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    // Conservative fallback for control characters.
+                    char buf[7];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x",
+                                  static_cast<unsigned char>(c));
+                    out.append(buf);
+                } else {
+                    out.push_back(c);
+                }
         }
     }
-
     out.push_back('"');
 }
 
-// Append one already-known Python scalar directly into the output buffer.
-// This avoids the old encode_scalar() temporary std::string on every value.
-static inline void append_scalar(std::string& out, const py::handle& v) {
-    if (v.is_none()) {
-        out.append("null");
-        return;
-    }
+static void append_string(std::string& out, const std::string& s) {
+    if (needs_quoting(s)) append_quoted(out, s);
+    else out.append(s);
+}
 
-    // Keep bool before int because bool is a Python int subclass.
+static bool is_scalar(const py::handle& v) {
+    return v.is_none() || PyBool_Check(v.ptr()) || PyLong_Check(v.ptr()) ||
+           PyFloat_Check(v.ptr()) || PyUnicode_Check(v.ptr());
+}
+
+static void append_scalar(std::string& out, const py::handle& v) {
+    if (v.is_none()) { out.append("null"); return; }
+
     if (PyBool_Check(v.ptr())) {
         out.append(PyObject_IsTrue(v.ptr()) ? "true" : "false");
         return;
     }
 
     if (PyLong_Check(v.ptr())) {
-        const long long value = PyLong_AsLongLong(v.ptr());
-
+        long long x = PyLong_AsLongLong(v.ptr());
         if (!PyErr_Occurred()) {
-            out.append(std::to_string(value));
+            out.append(std::to_string(x));
             return;
         }
-
-        // Preserve the old behavior for values that cannot fit in long long:
-        // clear the Python conversion error and fall through to the same
-        // unsupported-scalar error rather than silently changing semantics.
         PyErr_Clear();
-
-        throw std::runtime_error(
-            "encode_flat: unsupported integer outside signed 64-bit range"
-        );
+        throw std::runtime_error("toon_cpp: integer outside signed 64-bit range");
     }
 
     if (PyFloat_Check(v.ptr())) {
-        // Keep stream-based float formatting for semantic compatibility with
-        // the previous implementation. The major optimization is that the
-        // result is appended directly rather than returned as a temporary
-        // std::string.
         std::ostringstream oss;
         oss << PyFloat_AS_DOUBLE(v.ptr());
         out.append(oss.str());
@@ -146,305 +127,402 @@ static inline void append_scalar(std::string& out, const py::handle& v) {
     }
 
     if (PyUnicode_Check(v.ptr())) {
-        // pybind11 conversion is retained for Unicode correctness and to
-        // preserve the previous UTF-8 string behavior.
-        const std::string s = py::reinterpret_borrow<py::str>(v).cast<std::string>();
-        append_string(out, s);
+        append_string(out, py::reinterpret_borrow<py::str>(v).cast<std::string>());
         return;
     }
 
-    throw std::runtime_error(
-        "encode_flat: unsupported scalar type in flat row "
-        "(only str/int/float/bool/None supported)"
-    );
+    throw std::runtime_error("toon_cpp: unsupported scalar type");
 }
 
-// ---------- encode ----------
+static std::string key_to_string(const py::handle& key) {
+    if (!PyUnicode_Check(key.ptr()))
+        throw std::runtime_error("toon_cpp: object keys must be strings");
+    return key.cast<std::string>();
+}
 
-std::string encode_flat(const py::list& rows) {
-    const py::ssize_t row_count = py::len(rows);
+static void append_indent(std::string& out, int depth) {
+    out.append(static_cast<size_t>(depth * INDENT), ' ');
+}
 
-    if (row_count == 0) {
-        return "[0]{}:";
+// -----------------------------------------------------------------------------
+// Shape detection for tabular arrays
+// -----------------------------------------------------------------------------
+
+struct FieldInfo {
+    std::string name;
+    bool nested = false;
+    std::vector<FieldInfo> children;
+};
+
+static bool get_dict_keys(const py::dict& d, std::vector<std::string>& keys) {
+    keys.clear();
+    keys.reserve(d.size());
+    for (auto item : d) keys.push_back(key_to_string(item.first));
+    return true;
+}
+
+static bool same_key_set(const py::dict& a, const py::dict& b) {
+    if (a.size() != b.size()) return false;
+    for (auto item : a) {
+        if (!b.contains(item.first)) return false;
+    }
+    return true;
+}
+
+// A nested-uniform object is a non-empty dict whose columns recursively satisfy
+// the primitive/nested-uniform rule.
+static bool build_uniform_object_shape(const py::dict& first,
+                                       const py::list& objects,
+                                       std::vector<FieldInfo>& shape) {
+    if (first.size() == 0) return false;
+    shape.clear();
+
+    for (auto first_item : first) {
+        const std::string name = key_to_string(first_item.first);
+        FieldInfo fi;
+        fi.name = name;
+
+        bool all_nested_objects = true;
+        bool all_scalars = true;
+        py::handle first_value = first_item.second;
+
+        if (!PyDict_Check(first_value.ptr())) all_nested_objects = false;
+        if (!is_scalar(first_value)) all_scalars = false;
+
+        if (all_nested_objects) {
+            py::dict first_nested = py::reinterpret_borrow<py::dict>(first_value);
+            if (first_nested.size() == 0) return false;
+
+            // Check every row's corresponding value.
+            for (auto row_h : objects) {
+                py::dict row = py::reinterpret_borrow<py::dict>(row_h);
+                py::handle v = row[py::reinterpret_borrow<py::str>(first_item.first)];
+                if (!PyDict_Check(v.ptr())) { all_nested_objects = false; break; }
+                py::dict nd = py::reinterpret_borrow<py::dict>(v);
+                if (nd.size() == 0 || !same_key_set(first_nested, nd)) {
+                    all_nested_objects = false; break;
+                }
+            }
+
+            if (all_nested_objects) {
+                // Recursively validate the nested object column.
+                py::list nested_objects;
+                for (auto row_h : objects) {
+                    py::dict row = py::reinterpret_borrow<py::dict>(row_h);
+                    nested_objects.append(row[py::reinterpret_borrow<py::str>(first_item.first)]);
+                }
+                if (!build_uniform_object_shape(first_nested, nested_objects, fi.children))
+                    return false;
+                fi.nested = true;
+            }
+        }
+
+        if (!fi.nested) {
+            // Primitive column: every value must be scalar.
+            if (!all_scalars) return false;
+            for (auto row_h : objects) {
+                py::dict row = py::reinterpret_borrow<py::dict>(row_h);
+                py::handle v = row[py::reinterpret_borrow<py::str>(first_item.first)];
+                if (!is_scalar(v)) return false;
+            }
+        }
+
+        shape.push_back(std::move(fi));
+    }
+    return true;
+}
+
+static bool is_uniform_object_array(const py::list& arr, std::vector<FieldInfo>& shape) {
+    if (arr.size() == 0) return false;
+    py::handle first_h = arr[0];
+    if (!PyDict_Check(first_h.ptr())) return false;
+    py::dict first = py::reinterpret_borrow<py::dict>(first_h);
+    if (first.size() == 0) return false;
+
+    for (auto h : arr) {
+        if (!PyDict_Check(h.ptr())) return false;
+        py::dict d = py::reinterpret_borrow<py::dict>(h);
+        if (d.size() == 0 || !same_key_set(first, d)) return false;
     }
 
-    // Extract field names once.
-    py::dict first = py::reinterpret_borrow<py::dict>(rows[0]);
+    return build_uniform_object_shape(first, arr, shape);
+}
 
-    std::vector<std::string> fields;
-    std::vector<py::str> keys;
+static int leaf_count(const std::vector<FieldInfo>& shape) {
+    int n = 0;
+    for (const auto& f : shape)
+        n += f.nested ? leaf_count(f.children) : 1;
+    return n;
+}
 
-    fields.reserve(first.size());
-    keys.reserve(first.size());
-
-    for (auto item : first) {
-        py::str key = py::reinterpret_borrow<py::str>(item.first);
-        keys.push_back(key);
-        fields.push_back(key.cast<std::string>());
+static void append_field_group(std::string& out, const FieldInfo& f) {
+    append_string(out, f.name);
+    if (f.nested) {
+        out.push_back('{');
+        for (size_t i = 0; i < f.children.size(); ++i) {
+            if (i) out.push_back(DELIM);
+            append_field_group(out, f.children[i]);
+        }
+        out.push_back('}');
     }
+}
 
-    // Rough reservation. This is intentionally conservative: it reduces
-    // reallocations without requiring a costly pre-pass over all values.
-    size_t estimated = 32 + fields.size() * 16;
-    estimated += static_cast<size_t>(row_count) *
-                 (2 + fields.size() * 8);
-    std::string out;
-    out.reserve(estimated);
+// -----------------------------------------------------------------------------
+// Recursive encoding
+// -----------------------------------------------------------------------------
 
+static void append_primitive_array_inline(std::string& out, const py::list& arr) {
     out.push_back('[');
-    out.append(std::to_string(row_count));
-    out.append("]{");
-
-    for (size_t i = 0; i < fields.size(); ++i) {
-        if (i) out.push_back(',');
-        out.append(fields[i]);
+    out.append(std::to_string(arr.size()));
+    out.append("]: ");
+    for (size_t i = 0; i < static_cast<size_t>(arr.size()); ++i) {
+        if (i) out.push_back(DELIM);
+        if (!is_scalar(arr[i]))
+            throw std::runtime_error("toon_cpp: primitive array contains non-primitive value");
+        append_scalar(out, arr[i]);
     }
-
-    out.append("}:");
-
-    for (auto row_h : rows) {
-        // Avoid an additional cast through py::dict construction.
-        PyObject* row_obj = row_h.ptr();
-
-        if (!PyDict_Check(row_obj)) {
-            throw std::runtime_error(
-                "encode_flat: every row must be a dict"
-            );
-        }
-
-        out.append("\n  ");
-
-        for (size_t i = 0; i < fields.size(); ++i) {
-            if (i) out.push_back(',');
-
-            // One native Python dictionary lookup instead of:
-            //     row.contains(...)
-            //     row[py::str(fields[i])]
-            //
-            // The cached key object is reused for every row.
-            PyObject* value = PyDict_GetItemWithError(
-                row_obj,
-                keys[i].ptr()
-            );
-
-            if (!value) {
-                if (PyErr_Occurred())
-                    throw py::error_already_set();
-
-                throw std::runtime_error(
-                    "encode_flat: row missing field '" +
-                    fields[i] +
-                    "' -- all rows must share the same keys"
-                );
-            }
-
-            append_scalar(out, py::handle(value));
-        }
-    }
-
-    return out;
 }
 
-// ---------- decode ----------
+static void append_object_fields(std::string& out, const py::dict& obj, int depth);
+static void append_array_field(std::string& out, const std::string& key,
+                               const py::list& arr, int depth);
 
-static py::object type_field(const std::string& raw, bool was_quoted) {
-    if (was_quoted) return py::str(raw);
+static void append_tabular_rows(std::string& out, const py::list& arr,
+                                const std::vector<FieldInfo>& shape, int depth) {
+    for (auto row_h : arr) {
+        py::dict row = py::reinterpret_borrow<py::dict>(row_h);
+        append_indent(out, depth);
+        bool first_leaf = true;
 
-    if (raw == "true") return py::bool_(true);
-    if (raw == "false") return py::bool_(false);
-    if (raw == "null") return py::none();
+        std::function<void(const std::vector<FieldInfo>&, const py::dict&)> emit =
+            [&](const std::vector<FieldInfo>& fs, const py::dict& d) {
+                for (const auto& f : fs) {
+                    py::str k(f.name);
+                    py::handle v = d[k];
+                    if (f.nested) {
+                        py::dict nd = py::reinterpret_borrow<py::dict>(v);
+                        emit(f.children, nd);
+                    } else {
+                        if (!first_leaf) out.push_back(DELIM);
+                        append_scalar(out, v);
+                        first_leaf = false;
+                    }
+                }
+            };
 
-    if (looks_like_number(raw)) {
-        if (raw.find('.') != std::string::npos) {
-            return py::float_(std::stod(raw));
-        }
-
-        try {
-            return py::int_(std::stoll(raw));
-        } catch (...) {
-            return py::float_(std::stod(raw));
-        }
+        emit(shape, row);
+        out.push_back('\n');
     }
-
-    return py::str(raw);
 }
 
-static std::vector<std::pair<std::string, bool>>
-split_row_typed(const std::string& line) {
-    std::vector<std::pair<std::string, bool>> fields;
-    fields.reserve(8);
-
-    size_t i = 0;
-    const size_t n = line.size();
-
-    while (i <= n) {
-        std::string field;
-        bool quoted = false;
-
-        if (i < n && line[i] == '"') {
-            quoted = true;
-            ++i;
-
-            while (i < n) {
-                const char c = line[i];
-
-                if (c == '\\' && i + 1 < n) {
-                    const char nc = line[i + 1];
-
-                    if (nc == '\\') {
-                        field.push_back('\\');
-                        i += 2;
-                        continue;
-                    }
-
-                    if (nc == '"') {
-                        field.push_back('"');
-                        i += 2;
-                        continue;
-                    }
-
-                    if (nc == 'n') {
-                        field.push_back('\n');
-                        i += 2;
-                        continue;
-                    }
-
-                    field.push_back(c);
-                    ++i;
-                    continue;
-                }
-
-                if (c == '"') {
-                    ++i;
-                    break;
-                }
-
-                field.push_back(c);
-                ++i;
-            }
+static void append_array_value(std::string& out, const py::list& arr, int depth,
+                               bool keyed = false, const std::string& key = "") {
+    if (arr.size() == 0) {
+        if (!key.empty()) {
+            append_indent(out, depth);
+            append_string(out, key);
+            out.append(": []\n");
         } else {
-            while (i < n && line[i] != ',') {
-                field.push_back(line[i]);
-                ++i;
+            append_indent(out, depth);
+            out.append("[]\n");
+        }
+        return;
+    }
+
+    // Primitive arrays are inline.
+    bool all_scalar = true;
+    for (auto v : arr) if (!is_scalar(v)) { all_scalar = false; break; }
+    if (all_scalar) {
+        append_indent(out, depth);
+        if (!key.empty()) {
+            append_string(out, key);
+        }
+        append_primitive_array_inline(out, arr);
+        out.push_back('\n');
+        return;
+    }
+
+    std::vector<FieldInfo> shape;
+    if (is_uniform_object_array(arr, shape)) {
+        append_indent(out, depth);
+        if (!key.empty()) append_string(out, key);
+        out.push_back('[');
+        out.append(std::to_string(arr.size()));
+        out.push_back(']');
+        out.push_back('{');
+        for (size_t i = 0; i < shape.size(); ++i) {
+            if (i) out.push_back(DELIM);
+            append_field_group(out, shape[i]);
+        }
+        out.append(":\n");
+        append_tabular_rows(out, arr, shape, depth + 1);
+        return;
+    }
+
+    // Non-uniform / mixed array: list form.
+    append_indent(out, depth);
+    if (!key.empty()) append_string(out, key);
+    out.push_back('[');
+    out.append(std::to_string(arr.size()));
+    out.append("]:\n");
+
+    for (auto v : arr) {
+        append_indent(out, depth + 1);
+        out.append("- ");
+
+        if (is_scalar(v)) {
+            append_scalar(out, v);
+            out.push_back('\n');
+        } else if (PyDict_Check(v.ptr())) {
+            py::dict obj = py::reinterpret_borrow<py::dict>(v);
+            if (obj.size() == 0) {
+                out.push_back('\n');
+            } else {
+                // First field lives on the hyphen line, remaining fields at depth+1.
+                bool first = true;
+                for (auto item : obj) {
+                    const std::string k = key_to_string(item.first);
+                    py::handle val = item.second;
+                    if (!first) append_indent(out, depth + 2);
+                    append_string(out, k);
+                    out.append(":");
+                    if (is_scalar(val)) {
+                        out.push_back(' ');
+                        append_scalar(out, val);
+                        out.push_back('\n');
+                    } else if (PyDict_Check(val.ptr())) {
+                        out.push_back('\n');
+                        append_object_fields(out, py::reinterpret_borrow<py::dict>(val), depth + 2);
+                    } else if (PyList_Check(val.ptr())) {
+                        // The key and colon are already on the current list-item line.
+                        py::list arr = py::reinterpret_borrow<py::list>(val);
+                        if (arr.size() == 0) {
+                            out.append(" []\n");
+                        } else {
+                            bool primitive = true;
+                            for (auto x : arr) if (!is_scalar(x)) { primitive = false; break; }
+                            if (primitive) {
+                                out.push_back(' ');
+                                out.push_back('[');
+                                out.append(std::to_string(arr.size()));
+                                out.append("]: ");
+                                for (size_t j = 0; j < static_cast<size_t>(arr.size()); ++j) {
+                                    if (j) out.push_back(DELIM);
+                                    append_scalar(out, arr[j]);
+                                }
+                                out.push_back('\n');
+                            } else {
+                                out.push_back('\n');
+                                append_array_value(out, arr, depth + 2, false, "");
+                            }
+                        }
+                    } else {
+                        throw std::runtime_error("toon_cpp: unsupported nested value");
+                    }
+                    first = false;
+                }
+            }
+        } else if (PyList_Check(v.ptr())) {
+            // Nested arrays as list items: header remains on the list-item line.
+            py::list nested = py::reinterpret_borrow<py::list>(v);
+            if (nested.size() == 0) {
+                out.append("[]\n");
+            } else {
+                bool nested_scalars = true;
+                for (auto x : nested) if (!is_scalar(x)) { nested_scalars = false; break; }
+                if (nested_scalars) {
+                    out.push_back('[');
+                    out.append(std::to_string(nested.size()));
+                    out.append("]: ");
+                    for (size_t j = 0; j < static_cast<size_t>(nested.size()); ++j) {
+                        if (j) out.push_back(DELIM);
+                        append_scalar(out, nested[j]);
+                    }
+                    out.push_back('\n');
+                } else {
+                    out.push_back('[');
+                    out.append(std::to_string(nested.size()));
+                    out.append("]:\n");
+                    // Generic recursive fallback for nested array items.
+                    for (auto x : nested) {
+                        append_indent(out, depth + 2);
+                        out.append("- ");
+                        if (is_scalar(x)) append_scalar(out, x);
+                        else throw std::runtime_error("toon_cpp: deeply nested mixed arrays require additional list handling");
+                        out.push_back('\n');
+                    }
+                }
             }
         }
-
-        fields.emplace_back(std::move(field), quoted);
-
-        if (i < n && line[i] == ',') {
-            ++i;
-            continue;
-        }
-
-        break;
     }
-
-    return fields;
 }
 
-py::list decode_flat(const std::string& text) {
-    std::istringstream stream(text);
-    std::string header;
+static void append_array_field(std::string& out, const std::string& key,
+                               const py::list& arr, int depth) {
+    append_array_value(out, arr, depth, true, key);
+}
 
-    if (!std::getline(stream, header)) {
-        throw std::runtime_error(
-            "decode_flat: malformed header, expected '[N]{fields}:'"
-        );
-    }
+static void append_object_fields(std::string& out, const py::dict& obj, int depth) {
+    for (auto item : obj) {
+        const std::string key = key_to_string(item.first);
+        py::handle value = item.second;
 
-    const size_t lb = header.find('[');
-    const size_t rb = header.find(']');
-    const size_t cb = header.find('{');
-    const size_t cbe = header.find('}');
+        append_indent(out, depth);
+        append_string(out, key);
 
-    if (lb == std::string::npos || rb == std::string::npos ||
-        cb == std::string::npos || cbe == std::string::npos) {
-        throw std::runtime_error(
-            "decode_flat: malformed header, expected '[N]{fields}:'"
-        );
-    }
-
-    const long n = std::stol(
-        header.substr(lb + 1, rb - lb - 1)
-    );
-
-    const std::string field_str =
-        header.substr(cb + 1, cbe - cb - 1);
-
-    std::vector<std::string> fields;
-
-    if (!field_str.empty()) {
-        std::istringstream fs(field_str);
-        std::string f;
-
-        while (std::getline(fs, f, ',')) {
-            fields.push_back(std::move(f));
+        if (is_scalar(value)) {
+            out.append(": ");
+            append_scalar(out, value);
+            out.push_back('\n');
+        } else if (PyDict_Check(value.ptr())) {
+            py::dict child = py::reinterpret_borrow<py::dict>(value);
+            out.append(":\n");
+            if (child.size() == 0) continue;
+            append_object_fields(out, child, depth + 1);
+        } else if (PyList_Check(value.ptr())) {
+            py::list arr = py::reinterpret_borrow<py::list>(value);
+            append_array_field(out, key, arr, depth);
+        } else {
+            throw std::runtime_error("toon_cpp: unsupported object value type");
         }
     }
+}
 
-    py::list rows;
+static std::string encode_toon(const py::handle& value) {
+    std::string out;
+    out.reserve(1024);
 
-    std::string line;
-
-    for (long r = 0; r < n; ++r) {
-        if (!std::getline(stream, line)) {
-            throw std::runtime_error(
-                "decode_flat: expected " +
-                std::to_string(n) +
-                " rows, stream ended early"
-            );
-        }
-
-        size_t start = 0;
-
-        while (start < line.size() && line[start] == ' ')
-            ++start;
-
-        std::string content = line.substr(start);
-
-        auto typed_fields = split_row_typed(content);
-
-        if (typed_fields.size() != fields.size()) {
-            throw std::runtime_error(
-                "decode_flat: row " +
-                std::to_string(r) +
-                " has " +
-                std::to_string(typed_fields.size()) +
-                " fields, expected " +
-                std::to_string(fields.size())
-            );
-        }
-
-        py::dict row;
-
-        for (size_t i = 0; i < fields.size(); ++i) {
-            row[py::str(fields[i])] =
-                type_field(
-                    typed_fields[i].first,
-                    typed_fields[i].second
-                );
-        }
-
-        rows.append(std::move(row));
+    if (is_scalar(value)) {
+        append_scalar(out, value);
+        return out;
     }
 
-    return rows;
+    if (PyDict_Check(value.ptr())) {
+        py::dict obj = py::reinterpret_borrow<py::dict>(value);
+        append_object_fields(out, obj, 0);
+        if (!out.empty() && out.back() == '\n') out.pop_back();
+        return out;
+    }
+
+    if (PyList_Check(value.ptr())) {
+        py::list arr = py::reinterpret_borrow<py::list>(value);
+        append_array_value(out, arr, 0, false, "");
+        if (!out.empty() && out.back() == '\n') out.pop_back();
+        return out;
+    }
+
+    throw std::runtime_error("toon_cpp: root must be a JSON-compatible scalar, object, or array");
+}
+
+// Compatibility: flat arrays continue to use the same recursive encoder.
+static std::string encode_flat(const py::list& rows) {
+    return encode_toon(rows);
 }
 
 PYBIND11_MODULE(toon_cpp, m) {
-    m.doc() =
-        "Optimized C++ implementation of the flat/tabular TOON "
-        "encode/decode path.";
-
-    m.def(
-        "encode_flat",
-        &encode_flat,
-        "Encode a list of uniform dict rows to TOON flat/tabular text"
-    );
-
-    m.def(
-        "decode_flat",
-        &decode_flat,
-        "Decode TOON flat/tabular text back to a list of dict rows"
-    );
+    m.doc() = "Recursive C++ TOON encoder for JSON-shaped Python data";
+    m.def("encode_toon", &encode_toon,
+          "Recursively encode JSON-shaped Python data to TOON");
+    m.def("encode_flat", &encode_flat,
+          "Compatibility alias for recursively encoding flat/tabular rows");
 }

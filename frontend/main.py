@@ -164,8 +164,8 @@ def _do_request(client: httpx.Client, fmt, structure, n, encoding, level, source
         "structure": structure
     }
 
-    if fmt == "toon" and structure == "flat":
-        params["codec"] = "cpp"
+    if fmt == "toon":
+      params["codec"] = "cpp"
     if level is not None:
         params["level"] = level
     if source_mode == "cross":
