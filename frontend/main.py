@@ -651,6 +651,9 @@ async function runCase() {
       status.textContent = 'Experiment FAILED';
       document.getElementById('resultsArea').innerHTML =
         '<div class="fail-box"><b>Cache experiment failed:</b> ' + data.reason + '</div>';
+    } else if (data.case_type === 'cache') {
+      renderCache(data);
+      status.textContent = 'Done. Cache experiment: ' + data.mode;
     } else {
       render(data);
       status.textContent = 'Done. Experiment ID: ' + data.experiment_id + (data.preliminary ? ' (PRELIMINARY -- repeats<30)' : '');
@@ -713,6 +716,53 @@ function renderOneTrial(data, r, c) {
   html += statsRow('errors', r.json.error_count, r.toon.error_count, null);
   html += '</table>';
   return html;
+}
+
+function renderCache(data) {
+  let html = `<p><b>Case:</b> cache mode=${data.mode}, structure=${data.structure}, n=${data.n}, ` +
+             `repeats=${data.repeats}, warmup=${data.warmup}, seed=${data.seed}</p>`;
+
+  html += `<p class="note">Cache-miss request is populated separately and excluded from warm-cache statistics.</p>`;
+
+  html += '<table><tr><th>Metric</th><th>Value</th></tr>';
+  html += `<tr><td>cache miss latency_ms</td><td>${data.cache_miss_latency_ms}</td></tr>`;
+  html += `<tr><td>cache miss was actually a miss</td><td>${data.cache_miss_was_actually_miss}</td></tr>`;
+
+  const results = data.results || {};
+  for (const fmt of Object.keys(results)) {
+    const r = results[fmt];
+    html += `<tr><td colspan="2"><b>${fmt.toUpperCase()} cache</b></td></tr>`;
+    html += `<tr><td>bytes</td><td>${r.bytes}</td></tr>`;
+    html += `<tr><td>cache hit rate</td><td>${r.cache_hit_rate_pct}%</td></tr>`;
+    html += `<tr><td>warm-cache latency mean_ms</td><td>${r.latency.mean}</td></tr>`;
+    html += `<tr><td>warm-cache latency p50_ms</td><td>${r.latency.p50}</td></tr>`;
+    html += `<tr><td>warm-cache latency p90_ms</td><td>${r.latency.p90}</td></tr>`;
+    html += `<tr><td>warm-cache latency p95_ms</td><td>${r.latency.p95}</td></tr>`;
+    html += `<tr><td>warm-cache latency p99_ms</td><td>${r.latency.p99}</td></tr>`;
+    html += `<tr><td>warm-cache latency stdev_ms</td><td>${r.latency.stdev}</td></tr>`;
+    html += `<tr><td>warm-cache latency min/max_ms</td><td>${r.latency.min} / ${r.latency.max}</td></tr>`;
+    html += `<tr><td>sample count</td><td>${r.latency.n}</td></tr>`;
+  }
+  html += '</table>';
+
+  html += '<p class="note">Warm-cache latency distribution (each bar = one request):</p>';
+  const samples = data.samples || [];
+  for (const fmt of Object.keys(results)) {
+    const vals = samples.filter(s => s.format === fmt).map(s => s.latency_ms);
+    if (!vals.length) continue;
+    const max = Math.max(...vals);
+    html += `<p class="note">${fmt.toUpperCase()}</p><div class="hist">`;
+    for (const v of vals) {
+      html += `<div class="bar${fmt === 'toon' ? ' toon' : ''}" style="height:${max ? (v/max*60) : 0}px" title="${fmt.toUpperCase()} ${v} ms"></div>`;
+    }
+    html += '</div>';
+  }
+
+  html += `<div class="export-btns">
+    <button onclick="exportJson()">Download JSON</button>
+  </div>`;
+
+  document.getElementById('resultsArea').innerHTML = html;
 }
 
 function render(data) {
