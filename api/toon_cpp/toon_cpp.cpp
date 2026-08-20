@@ -1,4 +1,3 @@
-```
 // Recursive C++ TOON encoder for JSON-shaped Python data.
 //
 // API:
