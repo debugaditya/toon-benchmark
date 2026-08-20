@@ -50,8 +50,7 @@ from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 
-import toon_format  # official codec -- primary
-import toon_codec   # custom pure-Python codec -- secondary/reference only, has known bugs
+import toon_format  # decode bundled official TOON source files + validation only
 
 try:
     import toon_cpp  # C++ codec, flat + nested -- see toon_cpp/toon_cpp.cpp
@@ -128,7 +127,6 @@ N_CHOICES = [100, 1000, 10000, 100000]
 GZIP_LEVELS = [1, 5, 9]
 BROTLI_LEVELS = [1, 5, 9, 11]
 STRUCTURE_CHOICES = ["flat", "nested"]
-CODEC_CHOICES = ["official", "cpp", "custom"]
 
 
 def compress(body: bytes, encoding: str, level: int | None):
@@ -155,18 +153,16 @@ def compress(body: bytes, encoding: str, level: int | None):
     return body, None, None
 
 
-def toon_encode(rows, structure: str, codec: str) -> str:
-    if codec == "custom":
-        return toon_codec.encode_toon(rows, structure)
-    if codec == "cpp":
-        if not HAVE_CPP_TOON:
-            raise HTTPException(status_code=503,
-                                 detail=f"codec=cpp requested but the C++ extension is not built "
-                                        f"on this server (import error: {_CPP_TOON_IMPORT_ERROR}). "
-                                        f"Check /health -- falling back to codec=official is "
-                                        f"recommended when this is unavailable.")
-        return _cpp_encode(rows, structure)
-    return toon_format.encode(rows)  # official -- introspects the data, no structure param needed
+def toon_encode(rows, structure: str) -> str:
+    if not HAVE_CPP_TOON:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"C++ TOON codec is not built on this server "
+                f"(import error: {_CPP_TOON_IMPORT_ERROR})."
+            )
+        )
+    return _cpp_encode(rows, structure)
 
 
 @app.get("/health")
@@ -179,8 +175,7 @@ def health():
         "gzip_levels": GZIP_LEVELS,
         "brotli_levels": BROTLI_LEVELS,
         "n_choices": N_CHOICES,
-        "codec_choices": CODEC_CHOICES,
-        "primary_toon_codec": "official",
+        "primary_toon_codec": "cpp",
         "toon_format_version": getattr(toon_format, "__version__", "unknown"),
         "toon_format_pinned_commit": "e475c82e9da03dfaf88c0b277dee6b5d17100b13",
         "toon_spec_version_targeted": "4.1 (2026-07-26, Working Draft) -- github.com/toon-format/spec",
@@ -191,10 +186,6 @@ def health():
                              "across edge cases (see codec_comparison.py). ~60x faster than the "
                              "official pure-Python codec on encode (~6-7x on decode); flat encode "
                              "is now FASTER than JSON's C-accelerated encoder (~3x).",
-        "custom_codec_version": toon_codec.__version__,
-        "custom_codec_status": "secondary/reference only -- KNOWN correctness bugs (fails on "
-                                "strings containing commas; mistypes numeric-looking strings "
-                                "like '007'), never used for the TOON database or cache layer.",
         "python_version": platform.python_version(),
         "cpu_count": os.cpu_count(),
         "platform": platform.platform(),
@@ -220,9 +211,7 @@ def cases():
 @app.get("/data")
 def get_data(format: str = Query("json"), encoding: str = Query("identity"),
              level: int | None = Query(None), n: int = Query(10), structure: str = Query("flat"),
-             source: str = Query("auto"), codec: str = Query("official")):
-    if codec not in CODEC_CHOICES:
-        raise HTTPException(status_code=400, detail=f"Invalid codec '{codec}'; use one of {CODEC_CHOICES}.")
+             source: str = Query("auto")):
 
     if source == "auto":
         src = "json_db" if format != "toon" else "toon_db"
@@ -241,11 +230,13 @@ def get_data(format: str = Query("json"), encoding: str = Query("identity"),
     # --- Phase 2: serialization ---
     t1 = time.perf_counter()
     if format == "toon":
-        body_str = toon_encode(rows, structure, codec)
+        body_str = toon_encode(rows, structure)
         media = "text/toon"
+        active_codec = "cpp"
     else:
         body_str = json.dumps(rows)
         media = "application/json"
+        active_codec = "json"
     serialization_ms = (time.perf_counter() - t1) * 1000
 
     # --- Phase 3: UTF-8 encoding ---
@@ -275,16 +266,15 @@ def get_data(format: str = Query("json"), encoding: str = Query("identity"),
         "X-Encoding": encoding,
         "X-Level": str(actual_level) if actual_level is not None else "",
         "X-Source-DB": src,
-        "X-Codec": codec,
+        "X-Codec": active_codec,
     }
     if content_encoding_token:
         headers["Content-Encoding"] = content_encoding_token
     return Response(content=body, media_type=media, headers=headers)
 
 
-# ---------- Cache layer: uses the OFFICIAL codec exclusively ----------
-# (Cache experiments test caching behavior, not codec choice -- keeping the
-# codec fixed avoids mixing two independent variables.)
+# ---------- Cache layer ----------
+# All TOON serialization in cache paths uses the C++ TOON encoder.
 
 _CACHE: dict = {}
 
@@ -304,7 +294,10 @@ def get_cached_data(mode: str = Query("json_cache"), format: str = Query("json")
 
     elif mode == "toon_cache":
         if not hit:
-            _CACHE[key] = toon_format.encode(TOON_DB[structure][:n]).encode("utf-8")
+            _CACHE[key] = _cpp_encode(
+                TOON_DB[structure][:n],
+                structure
+            ).encode("utf-8")
         body = _CACHE[key]
         media = "text/toon"
 
@@ -312,7 +305,10 @@ def get_cached_data(mode: str = Query("json_cache"), format: str = Query("json")
         cache_key = ("canonical_toon", structure, n)
         hit = cache_key in _CACHE  # captured BEFORE populate -- see v4 bugfix notes
         if not hit:
-            _CACHE[cache_key] = toon_format.encode(TOON_DB[structure][:n]).encode("utf-8")
+            _CACHE[cache_key] = _cpp_encode(
+                TOON_DB[structure][:n],
+                structure
+            ).encode("utf-8")
         toon_bytes = _CACHE[cache_key]
         if format == "toon":
             body = toon_bytes
