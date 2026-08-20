@@ -1,3 +1,4 @@
+```
 // Recursive C++ TOON encoder for JSON-shaped Python data.
 //
 // API:
@@ -169,8 +170,8 @@ static bool same_key_set(const py::dict& a, const py::dict& b) {
     return true;
 }
 
-// A nested-uniform object is a non-empty dict whose columns recursively satisfy
-// the primitive/nested-uniform rule.
+// Recursive shape helpers are retained for compatibility, but tabular output
+// is intentionally restricted to flat object arrays for this benchmark.
 static bool build_uniform_object_shape(const py::dict& first,
                                        const py::list& objects,
                                        std::vector<FieldInfo>& shape) {
@@ -232,20 +233,46 @@ static bool build_uniform_object_shape(const py::dict& first,
     return true;
 }
 
-static bool is_uniform_object_array(const py::list& arr, std::vector<FieldInfo>& shape) {
+// Tabular TOON is used ONLY when every object in the array is flat:
+// every field value is a scalar. If an object contains a dict/list, the
+// official nested/list representation is preserved instead.
+static bool is_flat_uniform_object_array(const py::list& arr,
+                                         std::vector<FieldInfo>& shape) {
     if (arr.size() == 0) return false;
+
     py::handle first_h = arr[0];
     if (!PyDict_Check(first_h.ptr())) return false;
+
     py::dict first = py::reinterpret_borrow<py::dict>(first_h);
     if (first.size() == 0) return false;
 
-    for (auto h : arr) {
-        if (!PyDict_Check(h.ptr())) return false;
-        py::dict d = py::reinterpret_borrow<py::dict>(h);
-        if (d.size() == 0 || !same_key_set(first, d)) return false;
+    for (auto item : first) {
+        if (!is_scalar(item.second))
+            return false;
     }
 
-    return build_uniform_object_shape(first, arr, shape);
+    for (auto h : arr) {
+        if (!PyDict_Check(h.ptr())) return false;
+
+        py::dict d = py::reinterpret_borrow<py::dict>(h);
+        if (d.size() == 0 || !same_key_set(first, d))
+            return false;
+
+        for (auto item : d) {
+            if (!is_scalar(item.second))
+                return false;
+        }
+    }
+
+    shape.clear();
+    for (auto item : first) {
+        FieldInfo fi;
+        fi.name = key_to_string(item.first);
+        fi.nested = false;
+        shape.push_back(std::move(fi));
+    }
+
+    return true;
 }
 
 static int leaf_count(const std::vector<FieldInfo>& shape) {
@@ -343,7 +370,7 @@ static void append_array_value(std::string& out, const py::list& arr, int depth,
     }
 
     std::vector<FieldInfo> shape;
-    if (is_uniform_object_array(arr, shape)) {
+    if (is_flat_uniform_object_array(arr, shape)) {
         append_indent(out, depth);
         if (!key.empty()) append_string(out, key);
         out.push_back('[');
