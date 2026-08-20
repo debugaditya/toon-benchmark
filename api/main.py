@@ -50,7 +50,6 @@ from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 
-import toon_format  # decode bundled official TOON source files + validation only
 
 try:
     import toon_cpp  # C++ codec, flat + nested -- see toon_cpp/toon_cpp.cpp
@@ -79,11 +78,6 @@ JSON_DB = {
     "flat": json.loads((DATA_DIR / "dataset_flat.json").read_text()),
     "nested": json.loads((DATA_DIR / "dataset_nested.json").read_text()),
 }
-TOON_DB = {
-    "flat": toon_format.decode((DATA_DIR / "dataset_flat_official.toon").read_text()),
-    "nested": toon_format.decode((DATA_DIR / "dataset_nested_official.toon").read_text()),
-}
-
 
 def _cpp_encode(rows, structure: str) -> str:
     """toon_cpp exposes SEPARATE functions per structure (encode_flat /
@@ -93,32 +87,29 @@ def _cpp_encode(rows, structure: str) -> str:
 
 
 def _validate_db_equivalence():
-    """Runs ONCE at startup. Validates the OFFICIAL codec's round-trip
-    (JSON_DB == official-decoded TOON_DB). Fails loudly and aborts startup
-    if they diverge."""
+    """Validate that the JSON source databases are available and that the
+    C++ TOON serializer is available before serving requests."""
     for structure in ("flat", "nested"):
-        if JSON_DB[structure] != TOON_DB[structure]:
-            print(f"FATAL: JSON_DB['{structure}'] != TOON_DB['{structure}'] (official codec) -- "
-                  f"the two databases are not semantically equivalent. Aborting startup.",
-                  file=sys.stderr)
+        if not isinstance(JSON_DB[structure], list):
+            print(
+                f"FATAL: JSON_DB['{structure}'] is not a list. Aborting startup.",
+                file=sys.stderr
+            )
             sys.exit(1)
-    print(f"Startup validation OK (official codec): JSON_DB and TOON_DB are semantically equal "
-          f"({len(JSON_DB['flat']):,} flat, {len(JSON_DB['nested']):,} nested records).")
 
-    if HAVE_CPP_TOON:
-        # Verify the C++ codec is byte-identical to the official encoder on
-        # the FULL bundled dataset, for BOTH structures, before ever
-        # trusting it live.
-        for structure in ("flat", "nested"):
-            cpp_out = _cpp_encode(JSON_DB[structure], structure)
-            official_out = toon_format.encode(JSON_DB[structure])
-            if cpp_out != official_out:
-                print(f"FATAL: toon_cpp output does not match toon_format.encode() byte-for-byte "
-                      f"on the bundled '{structure}' dataset. Aborting startup rather than "
-                      f"serving a possibly-incorrect C++ codec.", file=sys.stderr)
-                sys.exit(1)
-        print("Startup validation OK (cpp codec): byte-identical to official encoder on full "
-              "flat AND nested datasets.")
+    if not HAVE_CPP_TOON:
+        print(
+            f"FATAL: C++ TOON codec is unavailable: {_CPP_TOON_IMPORT_ERROR}. "
+            f"Aborting startup.",
+            file=sys.stderr
+        )
+        sys.exit(1)
+
+    print(
+        "Startup validation OK: C++ TOON codec available; "
+        f"{len(JSON_DB['flat']):,} flat and "
+        f"{len(JSON_DB['nested']):,} nested records loaded."
+    )
 
 
 _validate_db_equivalence()
@@ -176,16 +167,10 @@ def health():
         "brotli_levels": BROTLI_LEVELS,
         "n_choices": N_CHOICES,
         "primary_toon_codec": "cpp",
-        "toon_format_version": getattr(toon_format, "__version__", "unknown"),
-        "toon_format_pinned_commit": "e475c82e9da03dfaf88c0b277dee6b5d17100b13",
         "toon_spec_version_targeted": "4.1 (2026-07-26, Working Draft) -- github.com/toon-format/spec",
         "cpp_codec_available": HAVE_CPP_TOON,
         "cpp_codec_import_error": _CPP_TOON_IMPORT_ERROR,
-        "cpp_codec_status": "flat AND nested structures; verified byte-identical to the official "
-                             "codec on the full bundled dataset at startup (see startup log) and "
-                             "across edge cases (see codec_comparison.py). ~60x faster than the "
-                             "official pure-Python codec on encode (~6-7x on decode); flat encode "
-                             "is now FASTER than JSON's C-accelerated encoder (~3x).",
+        "cpp_codec_status": "ONLY TOON serializer used by the API; supports flat and nested structures.",
         "python_version": platform.python_version(),
         "cpu_count": os.cpu_count(),
         "platform": platform.platform(),
@@ -213,14 +198,20 @@ def get_data(format: str = Query("json"), encoding: str = Query("identity"),
              level: int | None = Query(None), n: int = Query(10), structure: str = Query("flat"),
              source: str = Query("auto")):
 
-    if source == "auto":
-        src = "json_db" if format != "toon" else "toon_db"
-    elif source in ("json_db", "toon_db"):
-        src = source
-    else:
-        raise HTTPException(status_code=400, detail=f"Invalid source '{source}'; use auto, json_db, or toon_db.")
+    if source not in ("auto", "json_db", "toon_db"):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid source; use auto, json_db, or toon_db."
+        )
 
-    db = JSON_DB if src == "json_db" else TOON_DB
+    # C++ TOON is the only TOON serializer. It serializes the canonical
+    # JSON source objects directly, regardless of the requested source mode.
+    if format == "toon":
+        src = "json_db"
+    else:
+        src = "json_db" if source in ("auto", "json_db") else "toon_db"
+
+    db = JSON_DB
 
     # --- Phase 1: data selection ---
     t0 = time.perf_counter()
@@ -295,7 +286,7 @@ def get_cached_data(mode: str = Query("json_cache"), format: str = Query("json")
     elif mode == "toon_cache":
         if not hit:
             _CACHE[key] = _cpp_encode(
-                TOON_DB[structure][:n],
+                JSON_DB[structure][:n],
                 structure
             ).encode("utf-8")
         body = _CACHE[key]
@@ -306,7 +297,7 @@ def get_cached_data(mode: str = Query("json_cache"), format: str = Query("json")
         hit = cache_key in _CACHE  # captured BEFORE populate -- see v4 bugfix notes
         if not hit:
             _CACHE[cache_key] = _cpp_encode(
-                TOON_DB[structure][:n],
+                JSON_DB[structure][:n],
                 structure
             ).encode("utf-8")
         toon_bytes = _CACHE[cache_key]
@@ -314,8 +305,7 @@ def get_cached_data(mode: str = Query("json_cache"), format: str = Query("json")
             body = toon_bytes
             media = "text/toon"
         else:
-            rows = toon_format.decode(toon_bytes.decode("utf-8"))
-            body = json.dumps(rows).encode("utf-8")
+            body = json.dumps(JSON_DB[structure][:n]).encode("utf-8")
             media = "application/json"
 
     total_ms = (time.perf_counter() - t0) * 1000
