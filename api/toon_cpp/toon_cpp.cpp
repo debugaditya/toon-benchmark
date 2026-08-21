@@ -1,31 +1,3 @@
-// C++ implementation of TOON encode/decode for BOTH flat/tabular and
-// nested structures, matching the OFFICIAL toon-format package's verified
-// behavior exactly (reverse-engineered by probing its real output --
-// see codec_comparison.py and the nested-format probe notes).
-//
-// Optimizations applied (per profiling request): field-name py::str
-// objects are built once per encode call (not per row), dict field access
-// uses a single raw lookup instead of contains()+[] (two hash lookups),
-// output is built into a single pre-reserved std::string instead of
-// std::ostringstream, quoting-decision and escaping are combined into one
-// pass over each string instead of two, integer/float formatting uses
-// std::to_chars instead of iostream formatting, and scalar type dispatch
-// uses raw CPython C-API checks (PyBool_Check/PyLong_Check/etc.) instead
-// of pybind11's isinstance<> layer.
-//
-// Verified escaping rule (backslash-based, NOT CSV double-quoting):
-//   A value is quoted if it: contains ',' '"' '\' or a newline, has
-//   leading/trailing whitespace, is empty, or would be misparsed as
-//   int/float/true/false/null if left unquoted.
-//   Inside quotes: '\' -> '\\', '"' -> '\"', newline -> "\n" (2 chars).
-//
-// Flat format:  "[N]{field1,field2,...}:\n  v1,v2,...\n  ..."
-// Nested format: "[N]:\n  - key: value\n    nested_key:\n      sub: value\n    arr[M]: a,b\n  - ..."
-//   (one level of dict nesting + one optional trailing array-of-scalars
-//   field per row -- matches this benchmark's actual nested dataset shape;
-//   arbitrary deeper nesting is out of scope, same discipline as the
-//   flat-only scoping decision.)
-
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <string>
@@ -35,8 +7,6 @@
 #include <stdexcept>
 
 namespace py = pybind11;
-
-// ---------- shared: quoting decision + escaping, single pass ----------
 
 static bool looks_like_number(const char* s, size_t len) {
     if (len == 0) return false;
@@ -51,14 +21,12 @@ static bool looks_like_number(const char* s, size_t len) {
     }
     return seen_digit;
 }
+
 static bool looks_like_number(const std::string& s) { return looks_like_number(s.data(), s.size()); }
 
-// Appends the (possibly quoted+escaped) field representation of a string
-// directly onto `out`, deciding quoting and escaping in a single scan --
-// avoids the separate needs_quoting() + escape_quoted() double pass.
 static void append_string_field(std::string& out, const std::string& s) {
     bool needs_quote = s.empty() || s.front() == ' ' || s.back() == ' ' ||
-                        s == "true" || s == "false" || s == "null" || looks_like_number(s);
+                       s == "true" || s == "false" || s == "null" || looks_like_number(s);
     if (!needs_quote) {
         for (char c : s) {
             if (c == ',' || c == '"' || c == '\\' || c == '\n') { needs_quote = true; break; }
@@ -78,9 +46,6 @@ static void append_string_field(std::string& out, const std::string& s) {
     out += '"';
 }
 
-// Fast scalar dispatch using raw CPython C-API checks (bypasses pybind11's
-// isinstance<> layer, which goes through extra abstraction). Bool must be
-// checked before Long since bool is a subclass of int in Python.
 static void append_scalar(std::string& out, PyObject* v) {
     if (v == Py_None) { out += "null"; return; }
     if (PyBool_Check(v)) { out += (v == Py_True) ? "true" : "false"; return; }
@@ -108,14 +73,12 @@ static void append_scalar(std::string& out, PyObject* v) {
     throw std::runtime_error("append_scalar: unsupported scalar type (only str/int/float/bool/None supported)");
 }
 
-// ---------- FLAT encode/decode ----------
-
 std::string encode_flat(const py::list& rows) {
     if (rows.size() == 0) return "[0]{}:";
 
     py::dict first = rows[0].cast<py::dict>();
     std::vector<std::string> fields;
-    std::vector<py::str> field_keys;  // built ONCE, reused for every row's lookups
+    std::vector<py::str> field_keys;
     fields.reserve(py::len(first));
     field_keys.reserve(py::len(first));
     for (auto item : first) {
@@ -125,7 +88,7 @@ std::string encode_flat(const py::list& rows) {
     }
 
     std::string out;
-    out.reserve(rows.size() * (fields.size() * 8 + 8));  // rough size estimate, avoids reallocation churn
+    out.reserve(rows.size() * (fields.size() * 8 + 8));
 
     out += '[';
     { char buf[24]; auto r = std::to_chars(buf, buf + sizeof(buf), (long long)rows.size()); out.append(buf, r.ptr - buf); }
@@ -141,7 +104,7 @@ std::string encode_flat(const py::list& rows) {
         out += "\n  ";
         for (size_t i = 0; i < fields.size(); i++) {
             if (i) out += ',';
-            PyObject* val = PyDict_GetItem(row, field_keys[i].ptr());  // single lookup, no separate contains() check
+            PyObject* val = PyDict_GetItem(row, field_keys[i].ptr());
             if (!val) {
                 throw std::runtime_error("encode_flat: row missing field '" + fields[i] + "' -- all rows must share the same keys");
             }
@@ -239,180 +202,512 @@ py::list decode_flat(const std::string& text) {
     return rows;
 }
 
-// ---------- NESTED encode/decode ----------
-// Scope: each row = scalar fields + at most one nested dict field (one
-// level deep) + at most one array-of-scalars field. Matches this
-// benchmark's actual nested dataset shape exactly.
-
-static void encode_nested_row(std::string& out, PyObject* row, bool is_first_row) {
-    bool first_field = true;
-    PyObject *key, *value;
-    Py_ssize_t pos = 0;
-    while (PyDict_Next(row, &pos, &key, &value)) {
-        out += first_field ? "\n  - " : "\n    ";
-        Py_ssize_t klen;
-        const char* kdata = PyUnicode_AsUTF8AndSize(key, &klen);
-        std::string kstr(kdata, klen);
-
-        if (PyDict_Check(value)) {
-            out += kstr;
-            out += ':';
-            PyObject *sk, *sv;
-            Py_ssize_t spos = 0;
-            while (PyDict_Next(value, &spos, &sk, &sv)) {
-                Py_ssize_t sklen;
-                const char* skdata = PyUnicode_AsUTF8AndSize(sk, &sklen);
-                out += "\n      ";
-                out.append(skdata, sklen);
-                out += ": ";
-                append_scalar(out, sv);
-            }
-        } else if (PyList_Check(value)) {
-            Py_ssize_t alen = PyList_Size(value);
-            out += kstr;
-            out += '[';
-            { char buf[24]; auto r = std::to_chars(buf, buf + sizeof(buf), (long long)alen); out.append(buf, r.ptr - buf); }
-            out += "]:";
-            if (alen > 0) {
-                out += ' ';
-                for (Py_ssize_t i = 0; i < alen; i++) {
-                    if (i) out += ',';
-                    append_scalar(out, PyList_GetItem(value, i));
-                }
-            }
-        } else {
-            out += kstr;
-            out += ": ";
-            append_scalar(out, value);
-        }
-        first_field = false;
-    }
-}
-
-std::string encode_nested(const py::list& rows) {
-    std::string out;
-    out.reserve(rows.size() * 96);  // rough estimate
-    out += '[';
-    { char buf[24]; auto r = std::to_chars(buf, buf + sizeof(buf), (long long)rows.size()); out.append(buf, r.ptr - buf); }
-    out += "]:";
-    for (auto row_h : rows) {
-        encode_nested_row(out, row_h.ptr(), true);
-    }
-    return out;
-}
-
-// Parses one "key: value" / "key:" / "key[M]: a,b" line's content (already
-// stripped of leading indent) into (key, kind, raw_value_or_items).
-struct ParsedLine {
-    std::string key;
-    enum Kind { SCALAR, NESTED_OPEN, ARRAY } kind;
-    std::string scalar_raw;
-    bool scalar_quoted = false;
-    std::vector<std::pair<std::string, bool>> array_items;  // (raw, was_quoted) per item
+struct SchemaNode {
+    enum Kind { SCALAR, OBJECT, ARRAY };
+    Kind kind = SCALAR;
+    std::string name;
+    std::vector<SchemaNode> children;
 };
 
-static ParsedLine parse_field_line(const std::string& content) {
-    ParsedLine pl;
-    size_t bracket = content.find('[');
-    size_t colon = content.find(':');
-    if (bracket != std::string::npos && bracket < colon) {
-        // array field: "key[M]: items" or "key[0]:"
-        size_t close = content.find(']', bracket);
-        pl.key = content.substr(0, bracket);
-        pl.kind = ParsedLine::ARRAY;
-        size_t after_colon = content.find(": ", close);
-        if (after_colon != std::string::npos) {
-            std::string items_str = content.substr(after_colon + 2);
-            auto typed = split_row_typed(items_str);
-            pl.array_items = typed;
-        }  // else: empty array, e.g. "tags[0]:" -- pl.array_items stays empty
-        return pl;
+static void merge_schema(SchemaNode& node, PyObject* value) {
+    if (value == Py_None) return;
+
+    if (PyDict_Check(value)) {
+        if (node.kind != SchemaNode::OBJECT) {
+            node.kind = SchemaNode::OBJECT;
+            PyObject *key, *child_value;
+            Py_ssize_t pos = 0;
+            while (PyDict_Next(value, &pos, &key, &child_value)) {
+                if (!PyUnicode_Check(key)) {
+                    throw std::runtime_error("encode_nested: object keys must be strings");
+                }
+                Py_ssize_t klen;
+                const char* kdata = PyUnicode_AsUTF8AndSize(key, &klen);
+                SchemaNode child;
+                child.name = std::string(kdata, klen);
+                merge_schema(child, child_value);
+                node.children.push_back(child);
+            }
+        } else {
+            for (size_t i = 0; i < node.children.size(); ++i) {
+                PyObject* child_value = PyDict_GetItemString(value, node.children[i].name.c_str());
+                if (child_value) {
+                    merge_schema(node.children[i], child_value);
+                }
+            }
+        }
+    } else if (PyList_Check(value) || PyTuple_Check(value)) {
+        if (node.kind != SchemaNode::ARRAY) {
+            node.kind = SchemaNode::ARRAY;
+        }
+        if (node.children.empty()) {
+            Py_ssize_t len = PyList_Check(value) ? PyList_Size(value) : PyTuple_Size(value);
+            if (len > 0) {
+                PyObject* first = PyList_Check(value) ? PyList_GetItem(value, 0) : PyTuple_GetItem(value, 0);
+                SchemaNode child;
+                merge_schema(child, first);
+                node.children.push_back(child);
+            }
+        }
     }
-    pl.key = content.substr(0, colon);
-    if (colon == content.size() - 1) {
-        // bare "key:" with nothing after -- nested dict opener
-        pl.kind = ParsedLine::NESTED_OPEN;
-        return pl;
-    }
-    // "key: value"
-    pl.kind = ParsedLine::SCALAR;
-    std::string val_part = content.substr(colon + 2);  // skip ": "
-    auto typed = split_row_typed(val_part);  // reuse the quote-aware parser for a single value
-    pl.scalar_raw = typed.empty() ? "" : typed[0].first;
-    pl.scalar_quoted = typed.empty() ? false : typed[0].second;
-    return pl;
 }
 
-static py::object array_to_pylist(const std::vector<std::pair<std::string, bool>>& items) {
-    py::list out;
-    for (auto& [raw, quoted] : items) out.append(type_field(raw, quoted));
+static SchemaNode build_row_schema(const py::list& rows) {
+    SchemaNode root;
+    root.kind = SchemaNode::OBJECT;
+
+    if (rows.size() == 0) return root;
+
+    PyObject* first_row = rows[0].ptr();
+    if (!PyDict_Check(first_row)) {
+        throw std::runtime_error("encode_nested: every row must be a dictionary");
+    }
+
+    PyObject *key, *value;
+    Py_ssize_t pos = 0;
+    while (PyDict_Next(first_row, &pos, &key, &value)) {
+        if (!PyUnicode_Check(key)) {
+            throw std::runtime_error("encode_nested: row keys must be strings");
+        }
+        Py_ssize_t klen;
+        const char* kdata = PyUnicode_AsUTF8AndSize(key, &klen);
+        SchemaNode child;
+        child.name = std::string(kdata, klen);
+        root.children.push_back(child);
+    }
+
+    for (auto row_h : rows) {
+        PyObject* row = row_h.ptr();
+        if (!PyDict_Check(row)) continue;
+        for (size_t i = 0; i < root.children.size(); ++i) {
+            PyObject* child_value = PyDict_GetItemString(row, root.children[i].name.c_str());
+            if (child_value) {
+                merge_schema(root.children[i], child_value);
+            }
+        }
+    }
+
+    return root;
+}
+
+static void append_schema_node(std::string& out, const SchemaNode& node) {
+    out += node.name;
+    if (node.kind == SchemaNode::OBJECT) {
+        out += '{';
+        for (size_t i = 0; i < node.children.size(); ++i) {
+            if (i) out += ',';
+            append_schema_node(out, node.children[i]);
+        }
+        out += '}';
+    }
+}
+
+static void append_schema(std::string& out, const SchemaNode& root) {
+    for (size_t i = 0; i < root.children.size(); ++i) {
+        if (i) out += ',';
+        append_schema_node(out, root.children[i]);
+    }
+}
+
+static PyObject* dict_get_required(PyObject* dict, const std::string& key) {
+    PyObject* value = PyDict_GetItemString(dict, key.c_str());
+    if (!value) {
+        throw std::runtime_error("encode_nested: row missing field '" + key + "'");
+    }
+    return value;
+}
+
+static void append_nested_value(std::string& out, const SchemaNode& node, PyObject* value) {
+    if (node.kind == SchemaNode::SCALAR) {
+        append_scalar(out, value);
+        return;
+    }
+
+    if (node.kind == SchemaNode::OBJECT) {
+        if (value == Py_None) {
+            out += "null";
+            return;
+        }
+        if (!PyDict_Check(value)) {
+            throw std::runtime_error("encode_nested: expected object for field '" + node.name + "'");
+        }
+        out += '{';
+        for (size_t i = 0; i < node.children.size(); ++i) {
+            if (i) out += ',';
+            const SchemaNode& child = node.children[i];
+            PyObject* child_value = dict_get_required(value, child.name);
+            append_nested_value(out, child, child_value);
+        }
+        out += '}';
+        return;
+    }
+
+    if (value == Py_None) {
+        out += "null";
+        return;
+    }
+    Py_ssize_t len = 0;
+    if (PyList_Check(value)) {
+        len = PyList_Size(value);
+    } else if (PyTuple_Check(value)) {
+        len = PyTuple_Size(value);
+    } else {
+        throw std::runtime_error("encode_nested: expected array for field '" + node.name + "'");
+    }
+
+    out += '[';
+    {
+        char buf[24];
+        auto r = std::to_chars(buf, buf + sizeof(buf), (long long)len);
+        out.append(buf, r.ptr - buf);
+    }
+    out += "]{";
+    for (Py_ssize_t i = 0; i < len; ++i) {
+        if (i) out += ',';
+        PyObject* item = PyList_Check(value) ? PyList_GetItem(value, i) : PyTuple_GetItem(value, i);
+        append_scalar(out, item);
+    }
+    out += '}';
+}
+
+static void validate_schema_compatible(const SchemaNode& schema, PyObject* value) {
+    if (schema.kind == SchemaNode::SCALAR) {
+        return;
+    }
+
+    if (schema.kind == SchemaNode::OBJECT) {
+        if (!PyDict_Check(value)) {
+            throw std::runtime_error("encode_nested: schema mismatch for object '" + schema.name + "'");
+        }
+        for (const SchemaNode& child : schema.children) {
+            PyObject* child_value = dict_get_required(value, child.name);
+            if (child_value != Py_None) {
+                validate_schema_compatible(child, child_value);
+            }
+        }
+        return;
+    }
+
+    if (value == Py_None) return;
+
+    if (!PyList_Check(value) && !PyTuple_Check(value)) {
+        throw std::runtime_error("encode_nested: schema mismatch for array '" + schema.name + "'");
+    }
+    if (schema.children.empty()) return;
+    Py_ssize_t len = PyList_Check(value) ? PyList_Size(value) : PyTuple_Size(value);
+    for (Py_ssize_t i = 0; i < len; ++i) {
+        PyObject* item = PyList_Check(value) ? PyList_GetItem(value, i) : PyTuple_GetItem(value, i);
+        validate_schema_compatible(schema.children[0], item);
+    }
+}
+
+static std::string encode_nested(const py::list& rows) {
+    if (rows.size() == 0) {
+        return "[0]{}:";
+    }
+
+    SchemaNode schema = build_row_schema(rows);
+
+    for (auto row_h : rows) {
+        PyObject* row = row_h.ptr();
+        if (!PyDict_Check(row)) {
+            throw std::runtime_error("encode_nested: every row must be a dictionary");
+        }
+        for (const SchemaNode& field : schema.children) {
+            PyObject* value = dict_get_required(row, field.name);
+            if (value != Py_None) {
+                validate_schema_compatible(field, value);
+            }
+        }
+    }
+
+    std::string out;
+    out.reserve(rows.size() * 48 + 128);
+
+    out += '[';
+    {
+        char buf[24];
+        auto r = std::to_chars(buf, buf + sizeof(buf), (long long)rows.size());
+        out.append(buf, r.ptr - buf);
+    }
+    out += "]{";
+    append_schema(out, schema);
+    out += "}:";
+
+    for (auto row_h : rows) {
+        PyObject* row = row_h.ptr();
+        out += "\n  ";
+        for (size_t i = 0; i < schema.children.size(); ++i) {
+            if (i) out += ',';
+            const SchemaNode& field = schema.children[i];
+            PyObject* value = dict_get_required(row, field.name);
+            append_nested_value(out, field, value);
+        }
+    }
+
     return out;
+}
+
+static size_t find_matching_brace(const std::string& s, size_t open) {
+    int depth = 0;
+    bool quoted = false;
+    bool escaped = false;
+
+    for (size_t i = open; i < s.size(); ++i) {
+        char c = s[i];
+        if (quoted) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                quoted = false;
+            }
+            continue;
+        }
+        if (c == '"') {
+            quoted = true;
+            continue;
+        }
+        if (c == '{') ++depth;
+        else if (c == '}') {
+            --depth;
+            if (depth == 0) return i;
+        }
+    }
+    throw std::runtime_error("decode_nested: unmatched '{'");
+}
+
+static std::vector<std::string> split_top_level(const std::string& s, char delimiter) {
+    std::vector<std::string> parts;
+    size_t start = 0;
+    int brace_depth = 0;
+    int bracket_depth = 0;
+    bool quoted = false;
+    bool escaped = false;
+
+    for (size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if (quoted) {
+            if (escaped) escaped = false;
+            else if (c == '\\') escaped = true;
+            else if (c == '"') quoted = false;
+            continue;
+        }
+        if (c == '"') {
+            quoted = true;
+        } else if (c == '{') {
+            ++brace_depth;
+        } else if (c == '}') {
+            --brace_depth;
+        } else if (c == '[') {
+            ++bracket_depth;
+        } else if (c == ']') {
+            --bracket_depth;
+        } else if (c == delimiter && brace_depth == 0 && bracket_depth == 0) {
+            parts.push_back(s.substr(start, i - start));
+            start = i + 1;
+        }
+    }
+    parts.push_back(s.substr(start));
+    return parts;
+}
+
+struct NestedSchema {
+    std::string name;
+    enum Kind { SCALAR, OBJECT, ARRAY } kind = SCALAR;
+    std::vector<NestedSchema> children;
+};
+
+static NestedSchema parse_schema_node(const std::string& token) {
+    NestedSchema node;
+    size_t brace = token.find('{');
+
+    if (brace == std::string::npos) {
+        size_t bracket = token.find('[');
+        if (bracket != std::string::npos) {
+            node.name = token.substr(0, bracket);
+            node.kind = NestedSchema::ARRAY;
+        } else {
+            node.name = token;
+            node.kind = NestedSchema::SCALAR;
+        }
+        return node;
+    }
+
+    node.name = token.substr(0, brace);
+    node.kind = NestedSchema::OBJECT;
+    size_t close = find_matching_brace(token, brace);
+    std::string inside = token.substr(brace + 1, close - brace - 1);
+
+    if (!inside.empty()) {
+        for (const std::string& child : split_top_level(inside, ',')) {
+            node.children.push_back(parse_schema_node(child));
+        }
+    }
+    return node;
+}
+
+static std::vector<NestedSchema> parse_nested_schema(const std::string& header) {
+    size_t lb = header.find('[');
+    size_t rb = header.find(']');
+    if (lb == std::string::npos || rb == std::string::npos) {
+        throw std::runtime_error("decode_nested: malformed header");
+    }
+    size_t open = header.find('{', rb);
+    if (open == std::string::npos) {
+        throw std::runtime_error("decode_nested: missing schema");
+    }
+    size_t close = find_matching_brace(header, open);
+    std::string schema_text = header.substr(open + 1, close - open - 1);
+    std::vector<NestedSchema> schema;
+    if (!schema_text.empty()) {
+        for (const std::string& token : split_top_level(schema_text, ',')) {
+            schema.push_back(parse_schema_node(token));
+        }
+    }
+    return schema;
+}
+
+static size_t parse_nested_value(const std::string& text, size_t pos, const NestedSchema& schema, py::object& result) {
+    if (pos >= text.size()) {
+        throw std::runtime_error("decode_nested: unexpected end of row");
+    }
+
+    if (schema.kind == NestedSchema::SCALAR) {
+        size_t end = pos;
+        bool quoted = false;
+        if (text[pos] == '"') {
+            quoted = true;
+            ++end;
+            bool escaped = false;
+            while (end < text.size()) {
+                char c = text[end];
+                if (escaped) {
+                    escaped = false;
+                } else if (c == '\\') {
+                    escaped = true;
+                } else if (c == '"') {
+                    ++end;
+                    break;
+                }
+                ++end;
+            }
+        } else {
+            while (end < text.size() && text[end] != ',') {
+                ++end;
+            }
+        }
+        std::string raw = text.substr(pos, end - pos);
+        if (quoted) {
+            auto parsed = split_row_typed(raw);
+            if (parsed.empty()) {
+                result = py::str("");
+            } else {
+                result = py::str(parsed[0].first);
+            }
+        } else {
+            result = type_field(raw, false);
+        }
+        return end;
+    }
+
+    if (schema.kind == NestedSchema::OBJECT) {
+        if (text.compare(pos, 4, "null") == 0) {
+            result = py::none();
+            return pos + 4;
+        }
+        if (text[pos] != '{') {
+            throw std::runtime_error("decode_nested: expected '{' for object '" + schema.name + "'");
+        }
+        size_t close = find_matching_brace(text, pos);
+        std::string inside = text.substr(pos + 1, close - pos - 1);
+        auto values = split_top_level(inside, ',');
+        if (values.size() != schema.children.size()) {
+            throw std::runtime_error("decode_nested: object field count mismatch for '" + schema.name + "'");
+        }
+        py::dict obj;
+        for (size_t i = 0; i < schema.children.size(); ++i) {
+            py::object child;
+            parse_nested_value(values[i], 0, schema.children[i], child);
+            obj[py::str(schema.children[i].name)] = child;
+        }
+        result = obj;
+        return close + 1;
+    }
+
+    if (text.compare(pos, 4, "null") == 0) {
+        result = py::none();
+        return pos + 4;
+    }
+    if (text[pos] != '[') {
+        throw std::runtime_error("decode_nested: expected '[' for array '" + schema.name + "'");
+    }
+    size_t close_bracket = text.find(']', pos);
+    if (close_bracket == std::string::npos) {
+        throw std::runtime_error("decode_nested: malformed array");
+    }
+    long count = std::stol(text.substr(pos + 1, close_bracket - pos - 1));
+    if (close_bracket + 1 >= text.size() || text[close_bracket + 1] != '{') {
+        throw std::runtime_error("decode_nested: expected '{' after array length");
+    }
+    size_t close = find_matching_brace(text, close_bracket + 1);
+    std::string inside = text.substr(close_bracket + 2, close - close_bracket - 2);
+    py::list arr;
+    if (count > 0) {
+        auto items = split_top_level(inside, ',');
+        if ((long)items.size() != count) {
+            throw std::runtime_error("decode_nested: array length mismatch");
+        }
+        for (const std::string& item : items) {
+            auto parsed = split_row_typed(item);
+            if (parsed.empty()) {
+                arr.append(py::str(""));
+            } else {
+                arr.append(type_field(parsed[0].first, parsed[0].second));
+            }
+        }
+    }
+    result = arr;
+    return close + 1;
 }
 
 py::list decode_nested(const std::string& text) {
     std::istringstream stream(text);
     std::string header;
-    std::getline(stream, header);
-    size_t lb = header.find('['), rb = header.find(']');
+    if (!std::getline(stream, header)) {
+        throw std::runtime_error("decode_nested: empty input");
+    }
+    size_t lb = header.find('[');
+    size_t rb = header.find(']');
     if (lb == std::string::npos || rb == std::string::npos) {
-        throw std::runtime_error("decode_nested: malformed header, expected '[N]:'");
+        throw std::runtime_error("decode_nested: malformed header");
     }
     long n = std::stol(header.substr(lb + 1, rb - lb - 1));
-
-    std::vector<std::string> lines;
+    std::vector<NestedSchema> schema = parse_nested_schema(header);
     std::string line;
-    while (std::getline(stream, line)) lines.push_back(line);
-
     py::list rows;
-    size_t li = 0;
-    for (long r = 0; r < n; r++) {
-        py::dict row;
-        std::string open_nested_key;
-        py::dict open_nested_dict;
-        bool have_open_nested = false;
-        bool started = false;
-
-        while (li < lines.size()) {
-            const std::string& ln = lines[li];
-            bool is_bullet = ln.size() >= 4 && ln.compare(0, 4, "  - ") == 0;
-            if (is_bullet && started) break;  // next record begins
-
-            std::string content;
-            int indent;
-            if (is_bullet) { content = ln.substr(4); indent = 0; }
-            else if (ln.size() >= 6 && ln.compare(0, 6, "      ") == 0) { content = ln.substr(6); indent = 1; }
-            else if (ln.size() >= 4 && ln.compare(0, 4, "    ") == 0) { content = ln.substr(4); indent = 0; }
-            else break;
-
-            if (indent == 0) {
-                if (have_open_nested) {
-                    row[py::str(open_nested_key)] = open_nested_dict;
-                    have_open_nested = false;
-                    open_nested_dict = py::dict();
-                }
-                ParsedLine pl = parse_field_line(content);
-                if (pl.kind == ParsedLine::NESTED_OPEN) {
-                    open_nested_key = pl.key;
-                    have_open_nested = true;
-                } else if (pl.kind == ParsedLine::ARRAY) {
-                    row[py::str(pl.key)] = array_to_pylist(pl.array_items);
-                } else {
-                    row[py::str(pl.key)] = type_field(pl.scalar_raw, pl.scalar_quoted);
-                }
-            } else {  // indent == 1, nested subfield
-                size_t colon = content.find(':');
-                std::string subkey = content.substr(0, colon);
-                std::string val_part = content.substr(colon + 2);
-                auto typed = split_row_typed(val_part);
-                std::string raw = typed.empty() ? "" : typed[0].first;
-                bool quoted = typed.empty() ? false : typed[0].second;
-                open_nested_dict[py::str(subkey)] = type_field(raw, quoted);
-            }
-            started = true;
-            li++;
+    for (long r = 0; r < n; ++r) {
+        if (!std::getline(stream, line)) {
+            throw std::runtime_error("decode_nested: expected " + std::to_string(n) + " rows, stream ended early");
         }
-        if (have_open_nested) {
-            row[py::str(open_nested_key)] = open_nested_dict;
+        size_t start = 0;
+        while (start < line.size() && line[start] == ' ') {
+            ++start;
+        }
+        std::string content = line.substr(start);
+        if (content.empty()) {
+            throw std::runtime_error("decode_nested: empty row");
+        }
+        auto values = split_top_level(content, ',');
+        if (values.size() != schema.size()) {
+            throw std::runtime_error("decode_nested: row " + std::to_string(r) + " has " + std::to_string(values.size()) + " fields, expected " + std::to_string(schema.size()));
+        }
+        py::dict row;
+        for (size_t i = 0; i < schema.size(); ++i) {
+            py::object value;
+            parse_nested_value(values[i], 0, schema[i], value);
+            row[py::str(schema[i].name)] = value;
         }
         rows.append(row);
     }
@@ -420,8 +715,7 @@ py::list decode_nested(const std::string& text) {
 }
 
 PYBIND11_MODULE(toon_cpp, m) {
-    m.doc() = "C++ implementation of TOON encode/decode (flat + nested), "
-              "matching the official toon-format package's verified behavior.";
+    m.doc() = "C++ TOON encoder/decoder with flat and schema-hoisted recursive nested formats.";
     m.def("encode_flat", &encode_flat, "Encode a list of uniform dict rows to TOON flat/tabular text");
     m.def("decode_flat", &decode_flat, "Decode TOON flat/tabular text back to a list of dict rows");
     m.def("encode_nested", &encode_nested, "Encode a list of nested dict rows to TOON nested-block text");

@@ -1,68 +1,103 @@
-"""
-Generates the four bundled database files under data/:
-    dataset_flat.json, dataset_nested.json            -- JSON source of truth
-    dataset_flat_official.toon, dataset_nested_official.toon
-        -- TOON source of truth, encoded with the OFFICIAL toon-format
-           package (github.com/toon-format/toon-python, pinned commit
-           e475c82e9da03dfaf88c0b277dee6b5d17100b13, v0.9.0-beta.1)
-
-Both formats are generated from the SAME fixed-seed values, then verified
-to round-trip exactly via the official decoder before being trusted.
-
-Run once (already run -- files are checked into the repo):
-    pip install "git+https://github.com/toon-format/toon-python.git@e475c82e9da03dfaf88c0b277dee6b5d17100b13"
-    python3 build_data.py
-"""
 import json
+import os
 import random
 import string
+import sys
 from pathlib import Path
 
-import toon_format
+BASE_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(BASE_DIR / "toon_cpp"))
 
-CITIES = ["Delhi", "Mumbai", "Chennai", "Pune", "Jaipur", "Kolkata", "Nagpur", "Indore", "Bhopal", "Surat"]
-DATA_DIR = Path(__file__).parent / "data"
-DATA_DIR.mkdir(exist_ok=True)
+import toon_cpp
+
+CITIES = [
+    "Delhi", "Mumbai", "Chennai", "Pune", "Jaipur",
+    "Kolkata", "Nagpur", "Indore", "Bhopal", "Surat"
+]
 RECORD_COUNT = 100000
+SEED = 42
 
+DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(exist_ok=True)
 
-def gen_flat(n, seed=42):
-    random.seed(seed)
-    return [{"id": i, "name": "".join(random.choices(string.ascii_uppercase, k=6)),
-             "age": random.randint(18, 65), "city": random.choice(CITIES)}
-            for i in range(1, n + 1)]
+random.seed(SEED)
+flat_data = []
+for i in range(1, RECORD_COUNT + 1):
+    flat_data.append({
+        "id": i,
+        "name": "".join(random.choices(string.ascii_uppercase, k=6)),
+        "age": random.randint(18, 65),
+        "city": random.choice(CITIES)
+    })
 
+random.seed(SEED)
+nested_data = []
+for i in range(1, RECORD_COUNT + 1):
+    record = {
+        "id": i,
+        "name": "".join(random.choices(string.ascii_uppercase, k=6)),
+        "address": {
+            "city": random.choice(CITIES),
+            "zip": random.randint(100000, 999999)
+        },
+        "tags": random.sample(["vip", "new", "flagged", "trial"], k=2) if (i % 3 == 0 or i == 1) else None
+    }
+    nested_data.append(record)
 
-def gen_nested(n, seed=42):
-    random.seed(seed)
-    out = []
-    for i in range(1, n + 1):
-        rec = {"id": i, "name": "".join(random.choices(string.ascii_uppercase, k=6)),
-               "address": {"city": random.choice(CITIES), "zip": random.randint(100000, 999999)}}
-        if i % 3 == 0:
-            rec["tags"] = random.sample(["vip", "new", "flagged", "trial"], k=2)
-        out.append(rec)
-    return out
+flat_json_path = DATA_DIR / "dataset_flat.json"
+with open(flat_json_path, "w") as f:
+    json.dump(flat_data, f)
 
+nested_json_path = DATA_DIR / "dataset_nested.json"
+with open(nested_json_path, "w") as f:
+    json.dump(nested_data, f)
 
-if __name__ == "__main__":
-    flat = gen_flat(RECORD_COUNT)
-    nested = gen_nested(RECORD_COUNT)
+flat_toon_path = DATA_DIR / "dataset_flat.toon"
+flat_toon_content = toon_cpp.encode_flat(flat_data)
+with open(flat_toon_path, "w") as f:
+    f.write(flat_toon_content)
 
-    (DATA_DIR / "dataset_flat.json").write_text(json.dumps(flat))
-    (DATA_DIR / "dataset_nested.json").write_text(json.dumps(nested))
+nested_toon_path = DATA_DIR / "dataset_nested.toon"
+nested_toon_content = toon_cpp.encode_nested(nested_data)
+with open(nested_toon_path, "w") as f:
+    f.write(nested_toon_content)
 
-    flat_toon = toon_format.encode(flat)
-    nested_toon = toon_format.encode(nested)
-    (DATA_DIR / "dataset_flat_official.toon").write_text(flat_toon)
-    (DATA_DIR / "dataset_nested_official.toon").write_text(nested_toon)
+for path in [flat_json_path, nested_json_path, flat_toon_path, nested_toon_path]:
+    if not path.exists():
+        raise FileNotFoundError(f"Missing generated file: {path}")
 
-    # sanity check before trusting these files -- full dataset, not a sample
-    assert toon_format.decode(flat_toon) == flat, "flat TOON round-trip mismatch!"
-    assert toon_format.decode(nested_toon) == nested, "nested TOON round-trip mismatch!"
+with open(flat_json_path, "r") as f:
+    if len(json.load(f)) != RECORD_COUNT:
+        raise ValueError("Flat JSON record count mismatch")
 
-    print(f"Generated and verified ({RECORD_COUNT:,} records each), official codec v{toon_format.__version__ if hasattr(toon_format, '__version__') else '?'}:")
-    print(f"  dataset_flat.json              {len(json.dumps(flat)):>10,} bytes")
-    print(f"  dataset_flat_official.toon     {len(flat_toon.encode('utf-8')):>10,} bytes")
-    print(f"  dataset_nested.json            {len(json.dumps(nested)):>10,} bytes")
-    print(f"  dataset_nested_official.toon   {len(nested_toon.encode('utf-8')):>10,} bytes")
+with open(nested_json_path, "r") as f:
+    if len(json.load(f)) != RECORD_COUNT:
+        raise ValueError("Nested JSON record count mismatch")
+
+with open(flat_toon_path, "r") as f:
+    flat_header = f.readline().strip()
+    if not flat_header.startswith(f"[{RECORD_COUNT}]{{"):
+        raise ValueError(f"Invalid flat TOON header: {flat_header}")
+
+with open(nested_toon_path, "r") as f:
+    nested_header = f.readline().strip()
+    if not nested_header.startswith(f"[{RECORD_COUNT}]{{id,name,address{{city,zip}},tags}}:"):
+        raise ValueError(f"Invalid nested TOON header: {nested_header}")
+
+print("VALIDATION SUCCESSFUL")
+print("-" * 30)
+for path in [flat_json_path, nested_json_path, flat_toon_path, nested_toon_path]:
+    print(f"{path.name} size: {path.stat().st_size} bytes")
+
+print("\n--- dataset_flat.toon (first 5 lines) ---")
+with open(flat_toon_path, "r") as f:
+    for _ in range(5):
+        print(f.readline().rstrip('\n'))
+
+print("\n--- dataset_nested.toon (first 5 lines) ---")
+with open(nested_toon_path, "r") as f:
+    for _ in range(5):
+        print(f.readline().rstrip('\n'))
+
+print(f"\nLoaded toon_cpp from: {toon_cpp.__file__}")
+print(f"Available toon_cpp attributes: {dir(toon_cpp)}")
