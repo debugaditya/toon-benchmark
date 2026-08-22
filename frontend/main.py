@@ -21,9 +21,7 @@ import toon_cpp
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 
-API_BASE_URL = os.environ.get("API_BASE_URL", "http://localhost:9950")
-if API_BASE_URL and not API_BASE_URL.startswith("http"):
-    API_BASE_URL = f"https://{API_BASE_URL}"
+API_BASE_URL = "https://toon-benchmark-api.onrender.com"
 
 app = FastAPI(title="TOON vs JSON Benchmark Frontend v8")
 
@@ -630,11 +628,14 @@ async function runCase() {
   const btn = document.getElementById('runBtn');
   const status = document.getElementById('status');
   const ct = document.getElementById('caseType').value;
+
   btn.disabled = true;
   status.textContent = 'Running...';
-  document.getElementById('resultsArea').innerHTML = '';
+  document.getElementById('resultsArea').innerHTML =
+    '<p class="note">Benchmark is running. Please wait...</p>';
 
   let url;
+
   if (ct === 'research') {
     const params = new URLSearchParams({
       repeats: document.getElementById('researchRepeats').value,
@@ -654,24 +655,41 @@ async function runCase() {
       source_mode: document.getElementById('sourceMode').value,
       trials: document.getElementById('trials').value,
     });
-    const lvl = document.getElementById('level').value;
-    if (lvl) params.set('level', lvl);
+
+    const level = document.getElementById('level').value;
+    if (level && document.getElementById('levelField').style.display !== 'none') {
+      params.set('level', level);
+    }
+
     url = '/run?' + params.toString();
   }
 
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 300000);
+
   try {
-    const res = await fetch(url);
+    console.log('Starting benchmark:', url);
+
+    const res = await fetch(url, {
+      method: 'GET',
+      cache: 'no-store',
+      signal: controller.signal,
+      headers: { 'Accept': 'application/json' }
+    });
+
     const text = await res.text();
 
     if (!res.ok) {
-      throw new Error(`HTTP ${res.status}: ${text.slice(0, 500)}`);
+      throw new Error(`HTTP ${res.status}: ${text.slice(0, 1000)}`);
     }
 
     let data;
     try {
       data = JSON.parse(text);
     } catch (parseError) {
-      throw new Error(`Server returned non-JSON response: ${text.slice(0, 500)}`);
+      throw new Error(
+        `Server returned non-JSON response: ${text.slice(0, 1000)}`
+      );
     }
 
     if (data.error) {
@@ -681,12 +699,20 @@ async function runCase() {
     lastData = data;
     render(data);
     status.textContent = 'Done.';
+
   } catch (e) {
     console.error('Benchmark request failed:', e);
-    status.textContent = 'Error: ' + e.message;
+
+    const message =
+      e.name === 'AbortError'
+        ? 'Request timed out after 5 minutes. Check API_BASE_URL and API service logs.'
+        : e.message;
+
+    status.textContent = 'Error: ' + message;
     document.getElementById('resultsArea').innerHTML =
-      `<div class="fail-box"><b>Request failed:</b> ${e.message}</div>`;
+      `<div class="fail-box"><b>Request failed:</b> ${message}</div>`;
   } finally {
+    clearTimeout(timeout);
     btn.disabled = false;
   }
 }
