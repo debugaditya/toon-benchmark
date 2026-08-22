@@ -485,7 +485,7 @@ INDEX_HTML = """
 <div class="controls">
   <div class="field">
     <label>Case type</label>
-    <select id="caseType" onchange="toggleFields()">
+    <select id="caseType">
       <option value="plain">Format x compression</option>
       <option value="cache">Cache layer</option>
       <option value="research">Research mode</option>
@@ -501,7 +501,7 @@ INDEX_HTML = """
   </div>
   <div class="field" id="encodingField">
     <label>Compression</label>
-    <select id="encoding" onchange="updateLevels(); toggleFields()">
+    <select id="encoding">
       <option value="identity">none</option>
       <option value="gzip">gzip</option>
       <option value="brotli">brotli</option>
@@ -555,7 +555,7 @@ INDEX_HTML = """
     <label>Seed</label>
     <input id="seed" type="number" value="42" style="width:60px">
   </div>
-  <button id="runBtn" onclick="runCase()">Run</button>
+  <button id="runBtn" type="button">Run</button>
 </div>
 <p class="note" id="researchWarning" style="display:none">Research mode is an EXPLORATION tool, not for final data collection. Iterates through all combinations.</p>
 
@@ -843,6 +843,17 @@ function exportCsv() {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
+  const caseType = document.getElementById('caseType');
+  const encoding = document.getElementById('encoding');
+  const runBtn = document.getElementById('runBtn');
+
+  caseType.addEventListener('change', toggleFields);
+  encoding.addEventListener('change', () => {
+    updateLevels();
+    toggleFields();
+  });
+  runBtn.addEventListener('click', runCase);
+
   updateLevels();
   toggleFields();
 });
