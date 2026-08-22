@@ -445,12 +445,12 @@ INDEX_HTML = """
 <html>
 <head>
 <meta charset="utf-8">
-<title>TOON vs JSON Benchmark v8.2</title>
+<title>TOON vs JSON Benchmark</title>
 <style>
   body { font-family: -apple-system, sans-serif; max-width: 1050px; margin: 40px auto; padding: 0 20px; color: #222; }
   h1 { font-size: 22px; }
-  .controls { display: flex; gap: 10px; flex-wrap: wrap; align-items: end; margin: 20px 0; }
-  .field { display: flex; flex-direction: column; gap: 4px; }
+  .controls { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; margin: 20px 0; }
+  .field { display: flex; flex-direction: column; gap: 4px; flex: 0 0 auto; }
   label { font-size: 12px; color: #666; }
   select, button, input {
     padding: 7px 9px;
@@ -460,7 +460,13 @@ INDEX_HTML = """
     background: #fff;
     box-sizing: border-box;
     height: 35px;
-}
+  }
+  select { min-width: 72px; }
+  #level { width: 72px; min-width: 72px; }
+  #encoding { min-width: 88px; }
+  #sourceMode { min-width: 180px; }
+  #repeats { min-width: 145px; }
+  #runBtn { align-self: flex-end; }
   button { background: #222; color: white; border: none; cursor: pointer; }
   button:disabled { background: #999; }
   table { border-collapse: collapse; width: 100%; margin-top: 16px; font-size: 12.5px; }
@@ -474,8 +480,9 @@ INDEX_HTML = """
 </style>
 </head>
 <body>
-<h1>TOON vs JSON Benchmark v8.2</h1>
-<p style="color:#666">Bidirectional POST benchmarks over a persistent connection with paired randomization.</p>
+<h1>TOON vs JSON Benchmark</h1>
+<p style="color:#666">Requests are fired server-side against the API service in randomized PAIRS (JSON→TOON or TOON→JSON per pair, direction seeded), using one persistent connection for the whole run.</p>
+<details><summary>Methodology / terminology</summary><div class="note" style="margin-top:8px">JSON and TOON are measured in seeded randomized pairs. Warm-up requests are excluded from measured statistics. Cache misses are populated separately and excluded from warm-cache statistics.</div></details>
 
 <div class="controls">
   <div class="field">
@@ -504,7 +511,7 @@ INDEX_HTML = """
   </div>
   <div class="field" id="levelField">
     <label>Level</label>
-    <select id="level"></select>
+    <select id="level"><option value="1">1</option><option value="5" selected>5</option><option value="9">9</option><option value="11">11</option></select>
   </div>
   <div class="field" id="sourceModeField">
     <label>Database source</label>
@@ -566,16 +573,13 @@ function updateLevels() {
   const level = document.getElementById('level');
   if (!encoding || !levelField || !level) return;
 
-  let levels = [];
-  if (encoding.value === 'gzip') levels = [1, 5, 9];
-  else if (encoding.value === 'brotli') levels = [1, 5, 9, 11];
+  const levels =
+    encoding.value === 'gzip' ? [1, 5, 9] :
+    encoding.value === 'brotli' ? [1, 5, 9, 11] :
+    [];
 
-  level.innerHTML = '';
-
-  if (!levels.length) {
-    levelField.style.display = 'none';
-    return;
-  }
+  const previous = level.value;
+  level.replaceChildren();
 
   for (const value of levels) {
     const option = document.createElement('option');
@@ -584,33 +588,44 @@ function updateLevels() {
     level.appendChild(option);
   }
 
-  level.value = levels.includes(5) ? '5' : String(levels[0]);
-  levelField.style.display = 'flex';
+  if (levels.length) {
+    level.value = levels.includes(Number(previous)) ? previous : '5';
+    if (!level.value) level.value = String(levels[0]);
+    levelField.style.display = 'flex';
+  } else {
+    levelField.style.display = 'none';
+  }
 }
+
 function toggleFields() {
   const ct = document.getElementById('caseType').value;
   const isCache = ct === 'cache';
   const isResearch = ct === 'research';
   const enc = document.getElementById('encoding').value;
 
-  document.getElementById('encodingField').style.display = (isCache || isResearch) ? 'none' : 'flex';
-  document.getElementById('sourceModeField').style.display = isCache ? 'none' : 'flex';
-  document.getElementById('modeField').style.display = isCache ? 'flex' : 'none';
+  document.getElementById('encodingField').style.display =
+    (isCache || isResearch) ? 'none' : 'flex';
+  document.getElementById('sourceModeField').style.display =
+    isCache ? 'none' : 'flex';
+  document.getElementById('modeField').style.display =
+    isCache ? 'flex' : 'none';
 
-  if (isCache || isResearch || enc === 'identity') {
-    document.getElementById('levelField').style.display = 'none';
-  } else {
-    document.getElementById('levelField').style.display = 'flex';
-  }
+  const levelField = document.getElementById('levelField');
+  levelField.style.display =
+    (!isCache && !isResearch && enc !== 'identity') ? 'flex' : 'none';
 
   document.getElementById('nField').style.display = isResearch ? 'none' : 'flex';
   document.getElementById('structureField').style.display = isResearch ? 'none' : 'flex';
   document.getElementById('warmupField').style.display = isResearch ? 'none' : 'flex';
   document.getElementById('repeatsField').style.display = isResearch ? 'none' : 'flex';
-  document.getElementById('trialsField').style.display = (isCache || isResearch) ? 'none' : 'flex';
-  document.getElementById('researchRepeatsField').style.display = isResearch ? 'flex' : 'none';
-  document.getElementById('researchWarning').style.display = isResearch ? 'block' : 'none';
+  document.getElementById('trialsField').style.display =
+    (isCache || isResearch) ? 'none' : 'flex';
+  document.getElementById('researchRepeatsField').style.display =
+    isResearch ? 'flex' : 'none';
+  document.getElementById('researchWarning').style.display =
+    isResearch ? 'block' : 'none';
 }
+
 async function runCase() {
   const btn = document.getElementById('runBtn');
   const status = document.getElementById('status');
