@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 import httpx
 import toon_cpp
 from fastapi import FastAPI, Query
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 
 API_BASE_URL = "https://toon-benchmark-api.onrender.com"
 
@@ -563,6 +563,7 @@ INDEX_HTML = """
 <div id="resultsArea"></div>
 
 <script>
+
 let lastData = null;
 
 function updateLevels() {
@@ -857,10 +858,12 @@ document.addEventListener('DOMContentLoaded', () => {
   updateLevels();
   toggleFields();
 });
+
 </script>
 </body>
 </html>
 """
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return INDEX_HTML
