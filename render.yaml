@@ -3,9 +3,9 @@ services:
     name: toon-benchmark-api
     runtime: python
     plan: free
-    region: singapore   # Singapore
+    region: singapore
     rootDir: api
-    buildCommand: pip install -r requirements.txt && pip install ./toon_cpp
+    buildCommand: pip install -r requirements.txt && cd toon_cpp && python setup.py build_ext --inplace
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
 
@@ -13,11 +13,11 @@ services:
     name: toon-benchmark-frontend
     runtime: python
     plan: free
-    region: ohio   # US East -- real intercontinental distance from the api service (Singapore)
+    region: ohio
     rootDir: frontend
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install -r requirements.txt && cd toon_cpp && python setup.py build_ext --inplace
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
       - key: API_BASE_URL
-        value: https://toon-benchmark-api.onrender.com   # public URL -- private "host" property doesn't work cross-region, see README
+        value: https://toon-benchmark-api.onrender.com
