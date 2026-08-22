@@ -6,6 +6,10 @@ Key Updates:
   2. Restored 100-repeat options for final research measurements.
   3. Unified Cache Experiment: Cache tests run BOTH JSON and TOON in a single experiment,
      using the identical randomized pair order as the plain benchmark.
+  4. FIX: INDEX_HTML is now a raw string so embedded JS escape sequences like '\\n' are no
+     longer eaten by Python's string parser before reaching the browser. That was corrupting
+     the <script> block (a literal newline inside a single-quoted JS string is a SyntaxError),
+     which broke ALL event listeners, including the Run button.
 """
 import os
 import random
@@ -125,7 +129,7 @@ def _do_request(client: httpx.Client, endpoint, fmt, structure, n, encoding, lev
         "structure": structure,
         "source": source_mode
     }
-    
+
     if cache_mode:
         params["mode"] = cache_mode
     if level is not None:
@@ -290,12 +294,12 @@ def run_cache_case(mode, structure, n, repeats, warmup, seed):
         order, pair_directions = build_paired_order(repeats, seed)
         samples = []
         any_miss = False
-        
+
         for idx, fmt in enumerate(order):
             fmt_mode = "canonical_cache" if mode == "canonical_cache" else f"{fmt}_cache"
             rec = _do_request(client, "/cache/data", fmt, structure, n, "identity", None, "native", raw_data, cache_mode=fmt_mode)
             rec["request_index"] = idx
-            
+
             if not rec.get("cache_hit", True):
                 any_miss = True
             samples.append(rec)
@@ -316,7 +320,7 @@ def run_cache_case(mode, structure, n, repeats, warmup, seed):
             "cache_hit_rate_pct": 100.0,
             "latency": compute_stats(lat),
         }
-    
+
     comparison = {
         "cache_miss_latency": compute_diff(cache_miss_latency_ms["json"], cache_miss_latency_ms["toon"]),
         "bytes": compute_diff(results["json"]["bytes"], results["toon"]["bytes"]),
@@ -350,7 +354,7 @@ def run(case_type: str = Query("plain"), structure: str = Query("flat"), n: int 
         repeats: int = Query(15), warmup: int = Query(3), seed: int = Query(42),
         source_mode: str = Query("native"), trials: int = Query(1)):
 
-    trials = max(1, min(trials, 5)) 
+    trials = max(1, min(trials, 5))
     timestamp = datetime.now(timezone.utc).isoformat()
     base_experiment_id = f"{timestamp.replace(':', '').replace('-', '').split('.')[0]}Z_{structure}_{n}_{encoding}{level or ''}_{repeats}"
 
@@ -367,7 +371,7 @@ def run(case_type: str = Query("plain"), structure: str = Query("flat"), n: int 
 
         trial_results = []
         for t in range(trials):
-            trial_seed = seed + t * 1000 
+            trial_seed = seed + t * 1000
             trial_data = run_plain_case(structure, n, encoding, level, repeats, warmup, trial_seed, source_mode)
             trial_results.append({"trial_index": t, "seed": trial_seed, **trial_data})
 
@@ -415,7 +419,7 @@ def run_research(repeats: int = Query(15), warmup: int = Query(3), seed: int = Q
                 matrix.append({"type": "plain", "structure": structure, "n": n, "encoding": "gzip", "level": lvl})
             for lvl in BROTLI_LEVELS:
                 matrix.append({"type": "plain", "structure": structure, "n": n, "encoding": "brotli", "level": lvl})
-            
+
             # Generate the embedded cache experiments (each runs a JSON+TOON pair test)
             matrix.append({"type": "cache", "mode": "native", "structure": structure, "n": n})
             matrix.append({"type": "cache", "mode": "canonical_cache", "structure": structure, "n": n})
@@ -542,7 +546,7 @@ INDEX_HTML = """
     <label>Trials</label>
     <select id="trials"><option value="1" selected>1</option><option value="3">3</option></select>
   </div>
-  
+
   <div class="field" id="researchRepeatsField" style="display:none">
     <label>Repeats (research)</label>
     <select id="researchRepeats">
@@ -793,7 +797,7 @@ function renderResearch(data) {
     let lvl = c.level || '';
     let jp50 = c.type === 'cache' ? r.json.latency.p50 : r.json.http_latency.p50;
     let tp50 = c.type === 'cache' ? r.toon.latency.p50 : r.toon.http_latency.p50;
-    
+
     html += `<tr><td>${c.type}</td><td>${c.structure}</td><td>${c.n}</td><td>${enc_mode}</td><td>${lvl}</td>` +
             `<td>${jp50}</td><td>${tp50}</td></tr>`;
   }
@@ -821,7 +825,7 @@ function exportCsv() {
   let csv = cols.join(',') + '\n';
   const trialList = lastData.trial_results || [{trial_index: 0, samples: lastData.samples}];
   for (const tr of trialList) {
-    if (!tr.samples) continue; 
+    if (!tr.samples) continue;
     for (const s of tr.samples) {
       const row = {
         trial: tr.trial_index, experiment_id: lastData.experiment_id, timestamp: s.timestamp,
