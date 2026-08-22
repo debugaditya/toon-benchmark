@@ -2,12 +2,10 @@
 Frontend / "requesting server" for TOON vs JSON benchmark -- v8.1 (Bidirectional + Paired Caching).
 
 Key Updates:
-  1. Unified Cache Experiment: Cache tests now run BOTH JSON and TOON in a single experiment,
+  1. Fixed UI glitches: Rewrote updateLevels() to inject HTML directly to solve empty dropdowns.
+  2. Restored 100-repeat options for final research measurements.
+  3. Unified Cache Experiment: Cache tests run BOTH JSON and TOON in a single experiment,
      using the identical randomized pair order as the plain benchmark.
-  2. Equivalent Miss Treatment: Cache is cleared before measuring the JSON miss, and cleared 
-     again before measuring the TOON miss.
-  3. Restored Research Mode: 1 iteration now produces a paired JSON+TOON result for caches.
-  4. Exact CSV Export Headers matching requirements.
 """
 import os
 import random
@@ -407,7 +405,7 @@ def run(case_type: str = Query("plain"), structure: str = Query("flat"), n: int 
 @app.get("/run-research")
 def run_research(repeats: int = Query(15), warmup: int = Query(3), seed: int = Query(42)):
     """Restored Research Mode: 1 Iteration executes the full pairing for JSON/TOON per matrix element."""
-    if repeats not in (15, 30):
+    if repeats not in (15, 30, 100):
         repeats = 15
 
     matrix = []
@@ -520,7 +518,12 @@ INDEX_HTML = """
   </div>
   <div class="field" id="repeatsField">
     <label>Repeats</label>
-    <select id="repeats"><option value="5">5</option><option value="15" selected>15</option><option value="30">30</option></select>
+    <select id="repeats">
+      <option value="5">5 (quick test)</option>
+      <option value="15" selected>15</option>
+      <option value="30">30</option>
+      <option value="100">100 (final research)</option>
+    </select>
   </div>
   <div class="field" id="trialsField">
     <label>Trials</label>
@@ -529,7 +532,11 @@ INDEX_HTML = """
   
   <div class="field" id="researchRepeatsField" style="display:none">
     <label>Repeats (research)</label>
-    <select id="researchRepeats"><option value="15" selected>15</option><option value="30">30</option></select>
+    <select id="researchRepeats">
+      <option value="15" selected>15</option>
+      <option value="30">30</option>
+      <option value="100">100</option>
+    </select>
   </div>
   <div class="field">
     <label>Seed</label>
@@ -548,17 +555,17 @@ let lastData = null;
 function updateLevels() {
   const enc = document.getElementById('encoding').value;
   const levelSel = document.getElementById('level');
-  levelSel.innerHTML = '';
   let levels = [];
   if (enc === 'gzip') levels = [1,5,9];
   else if (enc === 'brotli') levels = [1,5,9,11];
-  document.getElementById('levelField').style.display = levels.length ? 'flex' : 'none';
+  
+  // Use innerHTML entirely to avoid browser DOM-appending render glitches
+  let optionsHtml = '';
   for (const l of levels) {
-    const opt = document.createElement('option');
-    opt.value = l; opt.textContent = l;
-    if (l === 5) opt.selected = true;
-    levelSel.appendChild(opt);
+    optionsHtml += `<option value="${l}" ${l === 5 ? 'selected' : ''}>${l}</option>`;
   }
+  levelSel.innerHTML = optionsHtml;
+  document.getElementById('levelField').style.display = levels.length ? 'flex' : 'none';
 }
 
 function toggleFields() {
