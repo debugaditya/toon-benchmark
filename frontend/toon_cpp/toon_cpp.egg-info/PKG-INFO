@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: toon_cpp
+Version: 0.2.0
+Summary: C++ implementation of TOON encode/decode (flat + nested), verified byte-identical to the official toon-format package's output.
+Dynamic: summary
