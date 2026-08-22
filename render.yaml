@@ -5,7 +5,7 @@ services:
     plan: free
     region: singapore
     rootDir: api
-    buildCommand: pip install -r requirements.txt && cd toon_cpp && python setup.py build_ext --inplace
+    buildCommand: pip install -r requirements.txt && cd toon_cpp && python setup.py build_ext --inplace && cp toon_cpp*.so .. && cd .. && python -c "import toon_cpp; print('TOON MODULE:', toon_cpp.__file__); print('TOON ATTRS:', [x for x in dir(toon_cpp) if 'encode' in x]); assert hasattr(toon_cpp, 'encode_flat'); assert hasattr(toon_cpp, 'encode_nested')"
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
 
@@ -15,7 +15,7 @@ services:
     plan: free
     region: ohio
     rootDir: frontend
-    buildCommand: pip install -r requirements.txt && cd toon_cpp && python setup.py build_ext --inplace
+    buildCommand: pip install -r requirements.txt && cd toon_cpp && python setup.py build_ext --inplace && cp toon_cpp*.so .. && cd .. && python -c "import toon_cpp; print('TOON MODULE:', toon_cpp.__file__); print('TOON ATTRS:', [x for x in dir(toon_cpp) if 'encode' in x]); assert hasattr(toon_cpp, 'encode_flat'); assert hasattr(toon_cpp, 'encode_nested')"
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
