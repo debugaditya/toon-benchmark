@@ -13,7 +13,6 @@ Key Architectural Updates:
      - Cross: Body sent in format Y, translated/returned in format X.
 """
 import gzip
-import gc
 import json
 import os
 import platform
@@ -46,33 +45,6 @@ except ImportError as e:
 
 app = FastAPI(title="TOON vs JSON Benchmark API v8")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-# Separate GC instrumentation. Existing benchmark timings are unchanged.
-_GC_TRACKER = {"active": False, "start_ns": None, "elapsed_ns": 0}
-
-def _gc_callback(phase, info):
-    if not _GC_TRACKER["active"]:
-        return
-    if phase == "start":
-        _GC_TRACKER["start_ns"] = time.perf_counter_ns()
-    elif phase == "stop" and _GC_TRACKER["start_ns"] is not None:
-        _GC_TRACKER["elapsed_ns"] += time.perf_counter_ns() - _GC_TRACKER["start_ns"]
-        _GC_TRACKER["start_ns"] = None
-
-if _gc_callback not in gc.callbacks:
-    gc.callbacks.append(_gc_callback)
-
-def _gc_tracking_start():
-    _GC_TRACKER["active"] = True
-    _GC_TRACKER["start_ns"] = None
-    _GC_TRACKER["elapsed_ns"] = 0
-
-def _gc_tracking_stop():
-    if _GC_TRACKER["start_ns"] is not None:
-        _GC_TRACKER["elapsed_ns"] += time.perf_counter_ns() - _GC_TRACKER["start_ns"]
-        _GC_TRACKER["start_ns"] = None
-    _GC_TRACKER["active"] = False
-    return _GC_TRACKER["elapsed_ns"] / 1_000_000.0
 
 DATA_DIR = Path(__file__).parent / "data"
 
@@ -147,10 +119,6 @@ async def post_data(request: Request, format: str = Query("json"), encoding: str
                     level: int | None = Query(None), n: int = Query(10), structure: str = Query("flat"),
                     source: str = Query("auto")):
 
-    # Start measuring naturally occurring Python GC during THIS API request.
-    # No GC is forced; this instrumentation only observes GC pauses.
-    _gc_tracking_start()
-
     # --- Phase 1a: Request Decompression ---
     t_decomp_start = time.perf_counter()
     raw_body = await request.body()
@@ -160,7 +128,6 @@ async def post_data(request: Request, format: str = Query("json"), encoding: str
     try:
         body_bytes = decompress(raw_body, content_encoding)
     except Exception as e:
-        _gc_tracking_stop()
         raise HTTPException(status_code=400, detail=f"Request decompression failed: {e}")
     request_decompression_ms = (time.perf_counter() - t_decomp_start) * 1000
 
@@ -175,7 +142,6 @@ async def post_data(request: Request, format: str = Query("json"), encoding: str
         else:
             rows = json.loads(body_str)
     except Exception as e:
-        _gc_tracking_stop()
         raise HTTPException(status_code=400, detail=f"Request deserialization failed ({input_format}): {e}")
         
     request_deserialization_ms = (time.perf_counter() - t_deser_start) * 1000
@@ -209,14 +175,10 @@ async def post_data(request: Request, format: str = Query("json"), encoding: str
     try:
         out_body, actual_level, out_content_encoding = compress(out_body, encoding, level)
     except RuntimeError as e:
-        _gc_tracking_stop()
         raise HTTPException(status_code=503, detail=str(e))
     compression_ms = (time.perf_counter() - t_out_comp) * 1000
 
     server_processing_ms = request_decode_ms + serialization_ms + utf8_encoding_ms + compression_ms
-
-    # GC is reported separately and is NOT included in server_processing_ms.
-    api_gc_ms = _gc_tracking_stop()
 
     headers = {
         "X-Request-Decompression-Time-Ms": f"{request_decompression_ms:.4f}",
@@ -226,7 +188,6 @@ async def post_data(request: Request, format: str = Query("json"), encoding: str
         "X-Utf8-Encoding-Time-Ms": f"{utf8_encoding_ms:.4f}",
         "X-Compression-Time-Ms": f"{compression_ms:.4f}",
         "X-Server-Processing-Time-Ms": f"{server_processing_ms:.4f}",
-        "X-Api-Gc-Time-Ms": f"{api_gc_ms:.4f}",
         "X-Raw-Bytes": str(raw_len),
         "X-Compressed-Bytes": str(len(out_body)),
         "X-Encoding": encoding,
