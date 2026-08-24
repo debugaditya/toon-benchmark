@@ -762,6 +762,17 @@ function statsRow(label, jsonV, toonV, diff) {
          `<td>${diff ? diff.improvement_percent + '%' : ''}</td></tr>`;
 }
 
+function compute_diff(json_val, toon_val) {
+  const abs_diff = toon_val - json_val;
+  const improvement_pct =
+    json_val ? ((json_val - toon_val) / json_val) * 100 : 0;
+
+  return {
+    absolute_difference: Number(abs_diff.toFixed(4)),
+    improvement_percent: Number(improvement_pct.toFixed(2))
+  };
+}
+
 function render(data) {
   if (data.research_run_id) {
     renderResearch(data);
