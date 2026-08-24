@@ -125,7 +125,7 @@ def _do_request(client: httpx.Client, endpoint, fmt, structure, n, encoding, lev
         "structure": structure,
         "source": source_mode
     }
-    
+
     if cache_mode:
         params["mode"] = cache_mode
     if level is not None:
@@ -136,56 +136,100 @@ def _do_request(client: httpx.Client, endpoint, fmt, structure, n, encoding, lev
     else:
         input_fmt = fmt
 
-    if input_fmt == "json":
-        body_bytes = json.dumps(raw_data).encode("utf-8")
-        content_type = "application/json"
-    else:
-        body_bytes = (toon_cpp.encode_flat(raw_data) if structure == "flat" else toon_cpp.encode_nested(raw_data)).encode("utf-8")
-        content_type = "application/x-toon"
+    body_bytes = None
+    headers = None
+    r = None
 
-    headers = {
-        "Content-Type": content_type,
-        "Accept": "application/x-toon" if fmt == "toon" else "application/json"
-    }
-
-    if encoding == "gzip":
-        body_bytes = gzip.compress(body_bytes, compresslevel=level if level else 9)
-        headers["Content-Encoding"] = "gzip"
-    elif encoding in ("brotli", "br"):
-        body_bytes = brotli.compress(body_bytes, quality=level if level else 5)
-        headers["Content-Encoding"] = "br"
-
-    t0 = time.perf_counter()
-    ts = datetime.now(timezone.utc).isoformat()
     try:
-        r = client.post(f"{API_BASE_URL}{endpoint}", params=params, content=body_bytes, headers=headers)
-        latency_ms = (time.perf_counter() - t0) * 1000
-        return {
-            "timestamp": ts, "format": fmt, "latency_ms": round(latency_ms, 3),
-            "cache_hit": r.headers.get("x-cache-hit") == "true",
-            "request_decompression_ms": float(r.headers.get("x-request-decompression-time-ms", 0)),
-            "request_deserialization_ms": float(r.headers.get("x-request-deserialization-time-ms", 0)),
-            "request_decode_ms": float(r.headers.get("x-request-decode-time-ms", 0)),
-            "serialization_ms": float(r.headers.get("x-serialization-time-ms", 0)),
-            "utf8_encoding_ms": float(r.headers.get("x-utf8-encoding-time-ms", 0)),
-            "compression_ms": float(r.headers.get("x-compression-time-ms", 0)),
-            "server_processing_ms": float(r.headers.get("x-server-processing-time-ms", 0)),
-            "raw_bytes": int(r.headers.get("x-raw-bytes", 0)),
-            "compressed_bytes": int(r.headers.get("x-compressed-bytes", r.headers.get("x-bytes", 0))),
-            "status_code": r.status_code,
-            "level": r.headers.get("x-level", ""),
-            "encoding": r.headers.get("x-encoding", encoding),
-            "source_db": r.headers.get("x-source-db", ""),
-        }
-    except Exception as e:
-        latency_ms = (time.perf_counter() - t0) * 1000
-        return {"timestamp": ts, "format": fmt, "latency_ms": round(latency_ms, 3),
-                    "cache_hit": False,
-                "request_decompression_ms": 0, "request_deserialization_ms": 0, "request_decode_ms": 0,
-                "serialization_ms": 0, "utf8_encoding_ms": 0, "compression_ms": 0, "server_processing_ms": 0,
-                "raw_bytes": 0, "compressed_bytes": 0, "status_code": 0, "error": str(e),
-                "level": "", "encoding": encoding, "source_db": ""}
+        if input_fmt == "json":
+            body_bytes = json.dumps(raw_data).encode("utf-8")
+            content_type = "application/json"
+        else:
+            body_bytes = (
+                toon_cpp.encode_flat(raw_data)
+                if structure == "flat"
+                else toon_cpp.encode_nested(raw_data)
+            ).encode("utf-8")
+            content_type = "application/x-toon"
 
+        headers = {
+            "Content-Type": content_type,
+            "Accept": "application/x-toon" if fmt == "toon" else "application/json"
+        }
+
+        if encoding == "gzip":
+            body_bytes = gzip.compress(
+                body_bytes, compresslevel=level if level else 9
+            )
+            headers["Content-Encoding"] = "gzip"
+        elif encoding in ("brotli", "br"):
+            body_bytes = brotli.compress(
+                body_bytes, quality=level if level else 5
+            )
+            headers["Content-Encoding"] = "br"
+
+        t0 = time.perf_counter()
+        ts = datetime.now(timezone.utc).isoformat()
+
+        try:
+            r = client.post(
+                f"{API_BASE_URL}{endpoint}",
+                params=params,
+                content=body_bytes,
+                headers=headers
+            )
+            latency_ms = (time.perf_counter() - t0) * 1000
+
+            result = {
+                "timestamp": ts, "format": fmt,
+                "latency_ms": round(latency_ms, 3),
+                "cache_hit": r.headers.get("x-cache-hit") == "true",
+                "request_decompression_ms": float(r.headers.get("x-request-decompression-time-ms", 0)),
+                "request_deserialization_ms": float(r.headers.get("x-request-deserialization-time-ms", 0)),
+                "request_decode_ms": float(r.headers.get("x-request-decode-time-ms", 0)),
+                "serialization_ms": float(r.headers.get("x-serialization-time-ms", 0)),
+                "utf8_encoding_ms": float(r.headers.get("x-utf8-encoding-time-ms", 0)),
+                "compression_ms": float(r.headers.get("x-compression-time-ms", 0)),
+                "server_processing_ms": float(r.headers.get("x-server-processing-time-ms", 0)),
+                "raw_bytes": int(r.headers.get("x-raw-bytes", 0)),
+                "compressed_bytes": int(r.headers.get("x-compressed-bytes", r.headers.get("x-bytes", 0))),
+                "status_code": r.status_code,
+                "level": r.headers.get("x-level", ""),
+                "encoding": r.headers.get("x-encoding", encoding),
+                "source_db": r.headers.get("x-source-db", ""),
+            }
+            return result
+
+        except Exception as e:
+            latency_ms = (time.perf_counter() - t0) * 1000
+            return {
+                "timestamp": ts, "format": fmt,
+                "latency_ms": round(latency_ms, 3),
+                "cache_hit": False,
+                "request_decompression_ms": 0,
+                "request_deserialization_ms": 0,
+                "request_decode_ms": 0,
+                "serialization_ms": 0,
+                "utf8_encoding_ms": 0,
+                "compression_ms": 0,
+                "server_processing_ms": 0,
+                "raw_bytes": 0,
+                "compressed_bytes": 0,
+                "status_code": 0,
+                "error": str(e),
+                "level": "",
+                "encoding": encoding,
+                "source_db": ""
+            }
+    finally:
+        # Release the response body/connection and the potentially very large
+        # request buffer as soon as this request is finished. No forced GC is
+        # used, so benchmark timings are not polluted by GC pauses.
+        if r is not None:
+            r.close()
+        del r
+        del body_bytes
+        del headers
 
 def run_plain_case(structure, n, encoding, level, repeats, warmup, seed, source_mode):
     order, pair_directions = build_paired_order(repeats, seed)
@@ -426,6 +470,8 @@ def run_research(repeats: int = Query(15), warmup: int = Query(3), seed: int = Q
             if case["type"] == "plain":
                 res = run_plain_case(case["structure"], case["n"], case["encoding"], case["level"], repeats, warmup, seed, "native")
                 all_results.append({**case, **res})
+                # Release the per-case local reference before starting the next case.
+                del res
             else:
                 res = run_cache_case(case["mode"], case["structure"], case["n"], repeats, warmup, seed)
                 all_results.append({**case, **res})

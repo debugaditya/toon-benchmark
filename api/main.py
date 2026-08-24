@@ -130,6 +130,7 @@ async def post_data(request: Request, format: str = Query("json"), encoding: str
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Request decompression failed: {e}")
     request_decompression_ms = (time.perf_counter() - t_decomp_start) * 1000
+    del raw_body
 
     # --- Phase 1b: Request Deserialization ---
     t_deser_start = time.perf_counter()
@@ -146,6 +147,8 @@ async def post_data(request: Request, format: str = Query("json"), encoding: str
         
     request_deserialization_ms = (time.perf_counter() - t_deser_start) * 1000
     request_decode_ms = request_decompression_ms + request_deserialization_ms
+    del body_str
+    del body_bytes
 
     src_db = f"cross_{input_format}_to_{format}" if (source == "cross" or input_format != format) else f"native_{format}"
 
@@ -169,6 +172,8 @@ async def post_data(request: Request, format: str = Query("json"), encoding: str
     out_body = out_body_str.encode("utf-8")
     utf8_encoding_ms = (time.perf_counter() - t_out_utf8) * 1000
     raw_len = len(out_body)
+    del out_body_str
+    del rows
 
     # --- Phase 4: Outbound Compression ---
     t_out_comp = time.perf_counter()
@@ -223,6 +228,8 @@ async def post_cached_data(request: Request, mode: str = Query("json_cache"), fo
             except Exception:
                 rows = JSON_DB.get(structure, [])[:n] if JSON_DB else []
             _CACHE[key] = json.dumps(rows).encode("utf-8")
+            del rows
+            del body_bytes
         body = _CACHE[key]
         media = "application/json"
 
@@ -234,6 +241,8 @@ async def post_cached_data(request: Request, mode: str = Query("json_cache"), fo
             except Exception:
                 rows = JSON_DB.get(structure, [])[:n] if JSON_DB else []
             _CACHE[key] = _cpp_encode(rows, structure).encode("utf-8")
+            del rows
+            del body_bytes
         body = _CACHE[key]
         media = "text/toon"
 
@@ -255,6 +264,7 @@ async def post_cached_data(request: Request, mode: str = Query("json_cache"), fo
         else:
             rows = _cpp_decode(toon_bytes.decode("utf-8"), structure)
             body = json.dumps(rows).encode("utf-8")
+            del rows
             media = "application/json"
 
     total_ms = (time.perf_counter() - t0) * 1000
