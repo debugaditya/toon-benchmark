@@ -146,7 +146,11 @@ def health():
 async def post_data(request: Request, format: str = Query("json"), encoding: str = Query("identity"),
                     level: int | None = Query(None), n: int = Query(10), structure: str = Query("flat"),
                     source: str = Query("auto")):
-    
+
+    # Start measuring naturally occurring Python GC during THIS API request.
+    # No GC is forced; this instrumentation only observes GC pauses.
+    _gc_tracking_start()
+
     # --- Phase 1a: Request Decompression ---
     t_decomp_start = time.perf_counter()
     raw_body = await request.body()
@@ -156,6 +160,7 @@ async def post_data(request: Request, format: str = Query("json"), encoding: str
     try:
         body_bytes = decompress(raw_body, content_encoding)
     except Exception as e:
+        _gc_tracking_stop()
         raise HTTPException(status_code=400, detail=f"Request decompression failed: {e}")
     request_decompression_ms = (time.perf_counter() - t_decomp_start) * 1000
 
@@ -170,6 +175,7 @@ async def post_data(request: Request, format: str = Query("json"), encoding: str
         else:
             rows = json.loads(body_str)
     except Exception as e:
+        _gc_tracking_stop()
         raise HTTPException(status_code=400, detail=f"Request deserialization failed ({input_format}): {e}")
         
     request_deserialization_ms = (time.perf_counter() - t_deser_start) * 1000
@@ -203,10 +209,13 @@ async def post_data(request: Request, format: str = Query("json"), encoding: str
     try:
         out_body, actual_level, out_content_encoding = compress(out_body, encoding, level)
     except RuntimeError as e:
+        _gc_tracking_stop()
         raise HTTPException(status_code=503, detail=str(e))
     compression_ms = (time.perf_counter() - t_out_comp) * 1000
 
     server_processing_ms = request_decode_ms + serialization_ms + utf8_encoding_ms + compression_ms
+
+    # GC is reported separately and is NOT included in server_processing_ms.
     api_gc_ms = _gc_tracking_stop()
 
     headers = {
