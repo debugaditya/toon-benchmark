@@ -692,8 +692,27 @@ async function runCase() {
       );
     }
 
-    if (data.error) {
-      throw new Error(data.message || data.error);
+    if (data.error || data.detail) {
+      throw new Error(data.message || data.error || data.detail);
+    }
+
+    // The API returns trial_results[0].results for trial-based runs.
+    // It also currently mirrors the first trial at top-level. Normalize both
+    // shapes here so the UI does not depend on one particular response shape.
+    if (!data.results && Array.isArray(data.trial_results) && data.trial_results.length) {
+      const firstTrial = data.trial_results[0];
+      if (firstTrial && firstTrial.results) {
+        data.results = firstTrial.results;
+        data.comparison = firstTrial.comparison || data.comparison;
+        data.samples = firstTrial.samples || data.samples;
+        data.order = firstTrial.order || data.order;
+        data.pair_directions = firstTrial.pair_directions || data.pair_directions;
+        data.warmup_order = firstTrial.warmup_order || data.warmup_order;
+      }
+    }
+
+    if (!data.results && data.case_type !== 'research' && data.case_type !== 'cache') {
+      throw new Error('Invalid benchmark response: missing results');
     }
 
     lastData = data;
@@ -765,8 +784,13 @@ function render(data) {
     return;
   }
 
-  // Fallback to normal rendering logic for format x compression
-  const r = data.results, c = data.comparison;
+  // Normal rendering logic for format x compression.
+  const r = data.results;
+  const c = data.comparison || {};
+
+  if (!r || !r.json || !r.toon) {
+    throw new Error('Invalid benchmark response: missing JSON/TOON results');
+  }
   let html = `<p><b>Case:</b> structure=${data.structure}, n=${data.n}, encoding=${data.encoding}${data.level ? ' level='+data.level : ''}, ` +
              `repeats=${data.repeats}, warmup=${data.warmup}, seed=${data.seed}, source=${data.source_mode}, trials=${data.trials}</p>`;
   html += '<table><tr><th>Metric</th><th>JSON</th><th>TOON</th><th>Abs diff</th><th>Improvement</th></tr>';
