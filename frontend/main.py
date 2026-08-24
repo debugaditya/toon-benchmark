@@ -665,7 +665,7 @@ async function runCase() {
   }
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 300000);
+  const timeout = setTimeout(() => controller.abort(), 86400000);
 
   try {
     console.log('Starting benchmark:', url);
@@ -724,7 +724,7 @@ async function runCase() {
 
     const message =
       e.name === 'AbortError'
-        ? 'Request timed out after 5 minutes. Check API_BASE_URL and API service logs.'
+        ? 'Request timed out after 24 hours. Check API_BASE_URL and API service logs.'
         : e.message;
 
     status.textContent = 'Error: ' + message;
