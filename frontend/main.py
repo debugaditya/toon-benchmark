@@ -8,6 +8,7 @@ Key Updates:
      using the identical randomized pair order as the plain benchmark.
 """
 import os
+import gc
 import random
 import statistics
 import time
@@ -28,6 +29,33 @@ app = FastAPI(title="TOON vs JSON Benchmark Frontend v8")
 GZIP_LEVELS = [1, 5, 9]
 BROTLI_LEVELS = [1, 5, 9, 11]
 MIN_SAMPLES_FOR_CI = 10
+
+# Separate GC instrumentation. Existing benchmark timings are unchanged.
+_GC_TRACKER = {"active": False, "start_ns": None, "elapsed_ns": 0}
+
+def _gc_callback(phase, info):
+    if not _GC_TRACKER["active"]:
+        return
+    if phase == "start":
+        _GC_TRACKER["start_ns"] = time.perf_counter_ns()
+    elif phase == "stop" and _GC_TRACKER["start_ns"] is not None:
+        _GC_TRACKER["elapsed_ns"] += time.perf_counter_ns() - _GC_TRACKER["start_ns"]
+        _GC_TRACKER["start_ns"] = None
+
+if _gc_callback not in gc.callbacks:
+    gc.callbacks.append(_gc_callback)
+
+def _gc_tracking_start():
+    _GC_TRACKER["active"] = True
+    _GC_TRACKER["start_ns"] = None
+    _GC_TRACKER["elapsed_ns"] = 0
+
+def _gc_tracking_stop():
+    if _GC_TRACKER["start_ns"] is not None:
+        _GC_TRACKER["elapsed_ns"] += time.perf_counter_ns() - _GC_TRACKER["start_ns"]
+        _GC_TRACKER["start_ns"] = None
+    _GC_TRACKER["active"] = False
+    return _GC_TRACKER["elapsed_ns"] / 1_000_000.0
 
 
 def generate_dummy_data(structure, n):
@@ -118,6 +146,7 @@ def build_paired_order(repeats, seed):
 
 
 def _do_request(client: httpx.Client, endpoint, fmt, structure, n, encoding, level, source_mode, raw_data, cache_mode=None):
+    _gc_tracking_start()
     params = {
         "format": fmt,
         "encoding": encoding,
@@ -160,8 +189,10 @@ def _do_request(client: httpx.Client, endpoint, fmt, structure, n, encoding, lev
     try:
         r = client.post(f"{API_BASE_URL}{endpoint}", params=params, content=body_bytes, headers=headers)
         latency_ms = (time.perf_counter() - t0) * 1000
+        frontend_gc_ms = _gc_tracking_stop()
         return {
             "timestamp": ts, "format": fmt, "latency_ms": round(latency_ms, 3),
+            "frontend_gc_ms": round(frontend_gc_ms, 4),
             "cache_hit": r.headers.get("x-cache-hit") == "true",
             "request_decompression_ms": float(r.headers.get("x-request-decompression-time-ms", 0)),
             "request_deserialization_ms": float(r.headers.get("x-request-deserialization-time-ms", 0)),
@@ -170,6 +201,7 @@ def _do_request(client: httpx.Client, endpoint, fmt, structure, n, encoding, lev
             "utf8_encoding_ms": float(r.headers.get("x-utf8-encoding-time-ms", 0)),
             "compression_ms": float(r.headers.get("x-compression-time-ms", 0)),
             "server_processing_ms": float(r.headers.get("x-server-processing-time-ms", 0)),
+            "api_gc_ms": float(r.headers.get("x-api-gc-time-ms", 0)),
             "raw_bytes": int(r.headers.get("x-raw-bytes", 0)),
             "compressed_bytes": int(r.headers.get("x-compressed-bytes", r.headers.get("x-bytes", 0))),
             "status_code": r.status_code,
@@ -179,7 +211,9 @@ def _do_request(client: httpx.Client, endpoint, fmt, structure, n, encoding, lev
         }
     except Exception as e:
         latency_ms = (time.perf_counter() - t0) * 1000
+        frontend_gc_ms = _gc_tracking_stop()
         return {"timestamp": ts, "format": fmt, "latency_ms": round(latency_ms, 3),
+                "frontend_gc_ms": round(frontend_gc_ms, 4),
                 "cache_hit": False,
                 "request_decompression_ms": 0, "request_deserialization_ms": 0, "request_decode_ms": 0,
                 "serialization_ms": 0, "utf8_encoding_ms": 0, "compression_ms": 0, "server_processing_ms": 0,
@@ -218,6 +252,8 @@ def run_plain_case(structure, n, encoding, level, repeats, warmup, seed, source_
         utf8 = [s["utf8_encoding_ms"] for s in ok]
         comp = [s["compression_ms"] for s in ok]
         sproc = [s["server_processing_ms"] for s in ok]
+        frontend_gc = [s["frontend_gc_ms"] for s in ok]
+        api_gc = [s["api_gc_ms"] for s in ok]
 
         http_stats = compute_stats(lat)
         http_stats["ci_mean_95"] = bootstrap_ci(lat, statistics.mean, seed) if lat else None
@@ -238,6 +274,8 @@ def run_plain_case(structure, n, encoding, level, repeats, warmup, seed, source_
             "utf8_encoding": compute_stats(utf8),
             "compression": compute_stats(comp),
             "server_processing": compute_stats(sproc),
+            "frontend_gc": compute_stats(frontend_gc),
+            "api_gc": compute_stats(api_gc),
             "first_measured_request_ms": fs[0]["latency_ms"] if fs else None,
             "error_count": len(fs) - len(ok),
         }
@@ -762,6 +800,10 @@ function render(data) {
   html += '<table><tr><th>Metric</th><th>JSON</th><th>TOON</th><th>Abs diff</th><th>Improvement</th></tr>';
   html += statsRow('raw_bytes', r.json.raw_bytes, r.toon.raw_bytes, c.raw_bytes);
   html += statsRow('compressed_bytes', r.json.compressed_bytes, r.toon.compressed_bytes, c.compressed_bytes);
+  html += statsRow('frontend_gc mean_ms', r.json.frontend_gc.mean, r.toon.frontend_gc.mean,
+                    compute_diff(r.json.frontend_gc.mean, r.toon.frontend_gc.mean));
+  html += statsRow('api_gc mean_ms', r.json.api_gc.mean, r.toon.api_gc.mean,
+                    compute_diff(r.json.api_gc.mean, r.toon.api_gc.mean));
   html += statsRow('request_decompression mean_ms', r.json.request_decompression.mean, r.toon.request_decompression.mean, null);
   html += statsRow('request_deserialization mean_ms', r.json.request_deserialization.mean, r.toon.request_deserialization.mean, null);
   html += statsRow('request_decode mean_ms', r.json.request_decode.mean, r.toon.request_decode.mean, c.request_decode_mean);
@@ -815,7 +857,7 @@ function exportJson() {
 function exportCsv() {
   if (!lastData) return;
   const cols = ['trial','experiment_id','timestamp','structure','n','format','encoding','level',
-                'request_index','request_decode_ms','request_decompression_ms','request_deserialization_ms',
+                'request_index','frontend_gc_ms','api_gc_ms','request_decode_ms','request_decompression_ms','request_deserialization_ms',
                 'serialization_ms','utf8_encoding_ms','compression_ms','server_processing_ms',
                 'http_latency_ms','raw_bytes','compressed_bytes','status_code','source_db'];
   let csv = cols.join(',') + '\\n';
@@ -826,7 +868,7 @@ function exportCsv() {
       const row = {
         trial: tr.trial_index, experiment_id: lastData.experiment_id, timestamp: s.timestamp,
         structure: lastData.structure, n: lastData.n, format: s.format, encoding: s.encoding,
-        level: s.level, request_index: s.request_index, request_decode_ms: s.request_decode_ms,
+        level: s.level, request_index: s.request_index, frontend_gc_ms: s.frontend_gc_ms, api_gc_ms: s.api_gc_ms, request_decode_ms: s.request_decode_ms,
         request_decompression_ms: s.request_decompression_ms, request_deserialization_ms: s.request_deserialization_ms,
         serialization_ms: s.serialization_ms, utf8_encoding_ms: s.utf8_encoding_ms,
         compression_ms: s.compression_ms, server_processing_ms: s.server_processing_ms,
