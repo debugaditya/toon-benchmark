@@ -22,7 +22,7 @@ import toon_cpp
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, Response
 
-API_BASE_URL = "https://toon-benchmark-api.onrender.com"
+API_BASE_URL = "https://toon-benchmark-api-3zli.onrender.com"
 
 app = FastAPI(title="TOON vs JSON Benchmark Frontend v8")
 
