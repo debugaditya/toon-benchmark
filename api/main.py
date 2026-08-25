@@ -2,15 +2,11 @@
 TOON vs JSON benchmark API -- v8 (Bidirectional).
 
 Key Architectural Updates:
-  1. Genuinely Bidirectional: Endpoints accept POST payloads in JSON or TOON.
-  2. Granular Inbound Timing:
-     - request_decompression_ms: Time taken to decompress gzip/brotli incoming bodies.
-     - request_deserialization_ms: Time taken to parse JSON or TOON using C++ toon_cpp.
-     - request_decode_ms: Total inbound processing time (decompression + deserialization).
-  3. Strict C++ Codec Usage: C++ toon_cpp is the sole encoder/decoder for TOON.
-  4. Functional Source Modes:
-     - Native: Body sent in format X, returned in format X.
-     - Cross: Body sent in format Y, translated/returned in format X.
+  1. The API owns the four canonical benchmark datasets.
+  2. Native requests use the matching JSON/TOON database.
+  3. Cross requests use the opposite database representation and translate it.
+  4. Benchmark requests contain no dataset payload.
+  5. C++ toon_cpp is the encoder/decoder for TOON.
 """
 import gzip
 import json
@@ -127,75 +123,90 @@ def health():
     }
 
 @app.post("/data")
-async def post_data(request: Request, format: str = Query("json"), encoding: str = Query("identity"),
-                    level: int | None = Query(None), n: int = Query(10), structure: str = Query("flat"),
-                    source: str = Query("auto")):
+async def post_data(
+    request: Request,
+    format: str = Query("json"),
+    encoding: str = Query("identity"),
+    level: int | None = Query(None),
+    n: int = Query(10),
+    structure: str = Query("flat"),
+    source: str = Query("native"),
+):
+    """
+    Benchmark request.
 
-    # --- Phase 1: Select the API-side canonical source ---
+    The frontend sends ONLY experiment parameters. The API already owns the
+    four canonical datasets under data/:
+
+        dataset_flat.json
+        dataset_nested.json
+        dataset_flat.toon
+        dataset_nested.toon
+
+    Native:
+        JSON  <- JSON_DB
+        TOON  <- TOON_DB
+
+    Cross:
+        JSON  <- TOON_DB -> JSON
+        TOON  <- JSON_DB -> TOON
+
+    No benchmark payload is generated or uploaded by the frontend.
+    """
+
+    if format not in ("json", "toon"):
+        raise HTTPException(status_code=400, detail="format must be json or toon")
+    if source not in ("native", "cross"):
+        raise HTTPException(status_code=400, detail="source must be native or cross")
+    if structure not in ("flat", "nested"):
+        raise HTTPException(status_code=400, detail="structure must be flat or nested")
+    if n < 1:
+        raise HTTPException(status_code=400, detail="n must be >= 1")
+
+    # The research frontend sends an empty request body. Do not deserialize
+    # anything from the request and do not measure nonexistent inbound work.
     raw_body = await request.body()
-    content_encoding = request.headers.get("content-encoding", "").lower()
-    content_type = request.headers.get("content-type", "").lower()
-
-    # The new frontend sends no dataset. The API owns both canonical
-    # representations and selects the source according to the experiment:
-    #
-    # Native: JSON -> JSON_DB, TOON -> TOON_DB
-    # Cross:  JSON -> TOON_DB, TOON -> JSON_DB
-    #
-    # "Cross" therefore means the opposite representation is the source.
-    native_db_request = len(raw_body) == 0
-
-    if native_db_request:
-        request_decompression_ms = 0.0
-        request_deserialization_ms = 0.0
-        request_decode_ms = 0.0
-
-        if source == "cross":
-            input_format = "toon" if format == "json" else "json"
-            rows = TOON_DB.get(structure, []) if input_format == "toon" else JSON_DB.get(structure, [])
-            src_db = f"cross_{input_format}_to_{format}"
-        else:
-            input_format = format
-            rows = JSON_DB.get(structure, []) if format == "json" else TOON_DB.get(structure, [])
-            src_db = f"native_{format}"
-
+    if raw_body:
         del raw_body
+        raise HTTPException(
+            status_code=400,
+            detail="Benchmark /data requests must not contain a dataset body"
+        )
+    del raw_body
+
+    # ------------------------------------------------------------
+    # Phase 1: API-side DB retrieval
+    # ------------------------------------------------------------
+    t_db = time.perf_counter()
+
+    if source == "native":
+        input_format = format
+        source_rows = (
+            JSON_DB.get(structure, [])
+            if format == "json"
+            else TOON_DB.get(structure, [])
+        )
+        src_db = f"native_{format}"
     else:
-        # Backward-compatible payload path. The final frontend does not use it.
-        t_decomp_start = time.perf_counter()
-        try:
-            body_bytes = decompress(raw_body, content_encoding)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Request decompression failed: {e}")
-        request_decompression_ms = (time.perf_counter() - t_decomp_start) * 1000
-        del raw_body
+        input_format = "toon" if format == "json" else "json"
+        source_rows = (
+            TOON_DB.get(structure, [])
+            if input_format == "toon"
+            else JSON_DB.get(structure, [])
+        )
+        src_db = f"cross_{input_format}_to_{format}"
 
-        t_deser_start = time.perf_counter()
-        body_str = body_bytes.decode("utf-8")
-        input_format = "toon" if ("toon" in content_type or "x-toon" in content_type) else "json"
+    # Only the requested n rows are carried into the serialization phase.
+    rows = source_rows[:n]
+    del source_rows
 
-        try:
-            if input_format == "toon":
-                rows = _cpp_decode(body_str, structure)
-            else:
-                rows = json.loads(body_str)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Request deserialization failed ({input_format}): {e}")
+    db_retrieval_ms = (time.perf_counter() - t_db) * 1000
 
-        request_deserialization_ms = (time.perf_counter() - t_deser_start) * 1000
-        request_decode_ms = request_decompression_ms + request_deserialization_ms
-        del body_str
-        del body_bytes
-
-        src_db = f"cross_{input_format}_to_{format}" if (source == "cross" or input_format != format) else f"native_{format}"
-
-    if isinstance(rows, list):
-        rows = rows[:n]
-
-    request_decode_ms = request_decompression_ms + request_deserialization_ms
-
-    # --- Phase 2: Outbound Serialization ---
+    # ------------------------------------------------------------
+    # Phase 2: Serialization / translation
+    # ------------------------------------------------------------
     t_out_ser = time.perf_counter()
+
     if format == "toon":
         out_body_str = _cpp_encode(rows, structure)
         media = "text/toon"
@@ -204,30 +215,45 @@ async def post_data(request: Request, format: str = Query("json"), encoding: str
         out_body_str = json.dumps(rows)
         media = "application/json"
         active_codec = "json"
+
     serialization_ms = (time.perf_counter() - t_out_ser) * 1000
 
-    # --- Phase 3: UTF-8 Encoding ---
+    # Release Python row references immediately after serialization.
+    del rows
+
+    # ------------------------------------------------------------
+    # Phase 3: UTF-8 encoding
+    # ------------------------------------------------------------
     t_out_utf8 = time.perf_counter()
     out_body = out_body_str.encode("utf-8")
     utf8_encoding_ms = (time.perf_counter() - t_out_utf8) * 1000
-    raw_len = len(out_body)
     del out_body_str
-    del rows
 
-    # --- Phase 4: Outbound Compression ---
+    raw_len = len(out_body)
+
+    # ------------------------------------------------------------
+    # Phase 4: Outbound compression
+    # ------------------------------------------------------------
     t_out_comp = time.perf_counter()
     try:
-        out_body, actual_level, out_content_encoding = compress(out_body, encoding, level)
+        out_body, actual_level, out_content_encoding = compress(
+            out_body, encoding, level
+        )
     except RuntimeError as e:
+        del out_body
         raise HTTPException(status_code=503, detail=str(e))
+
     compression_ms = (time.perf_counter() - t_out_comp) * 1000
 
-    server_processing_ms = request_decode_ms + serialization_ms + utf8_encoding_ms + compression_ms
+    server_processing_ms = (
+        db_retrieval_ms
+        + serialization_ms
+        + utf8_encoding_ms
+        + compression_ms
+    )
 
     headers = {
-        "X-Request-Decompression-Time-Ms": f"{request_decompression_ms:.4f}",
-        "X-Request-Deserialization-Time-Ms": f"{request_deserialization_ms:.4f}",
-        "X-Request-Decode-Time-Ms": f"{request_decode_ms:.4f}",
+        "X-DB-Retrieval-Time-Ms": f"{db_retrieval_ms:.4f}",
         "X-Serialization-Time-Ms": f"{serialization_ms:.4f}",
         "X-Utf8-Encoding-Time-Ms": f"{utf8_encoding_ms:.4f}",
         "X-Compression-Time-Ms": f"{compression_ms:.4f}",
@@ -239,11 +265,15 @@ async def post_data(request: Request, format: str = Query("json"), encoding: str
         "X-Source-DB": src_db,
         "X-Codec": active_codec,
     }
+
     if out_content_encoding:
         headers["Content-Encoding"] = out_content_encoding
-        
-    return Response(content=out_body, media_type=media, headers=headers)
 
+    return Response(
+        content=out_body,
+        media_type=media,
+        headers=headers,
+    )
 
 # ---------- Cache Layer ----------
 _CACHE: dict = {}

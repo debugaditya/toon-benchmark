@@ -149,9 +149,7 @@ def _do_request(client: httpx.Client, endpoint, fmt, structure, n, encoding, lev
                 "timestamp": ts, "format": fmt,
                 "latency_ms": round(latency_ms, 3),
                 "cache_hit": r.headers.get("x-cache-hit") == "true",
-                "request_decompression_ms": float(r.headers.get("x-request-decompression-time-ms", 0)),
-                "request_deserialization_ms": float(r.headers.get("x-request-deserialization-time-ms", 0)),
-                "request_decode_ms": float(r.headers.get("x-request-decode-time-ms", 0)),
+                "db_retrieval_ms": float(r.headers.get("x-db-retrieval-time-ms", 0)),
                 "serialization_ms": float(r.headers.get("x-serialization-time-ms", 0)),
                 "utf8_encoding_ms": float(r.headers.get("x-utf8-encoding-time-ms", 0)),
                 "compression_ms": float(r.headers.get("x-compression-time-ms", 0)),
@@ -171,9 +169,7 @@ def _do_request(client: httpx.Client, endpoint, fmt, structure, n, encoding, lev
                 "timestamp": ts, "format": fmt,
                 "latency_ms": round(latency_ms, 3),
                 "cache_hit": False,
-                "request_decompression_ms": 0,
-                "request_deserialization_ms": 0,
-                "request_decode_ms": 0,
+                "db_retrieval_ms": 0,
                 "serialization_ms": 0,
                 "utf8_encoding_ms": 0,
                 "compression_ms": 0,
@@ -221,13 +217,12 @@ def run_plain_case(structure, n, encoding, level, repeats, warmup, seed, source_
         fs = by_fmt[fmt]
         ok = [s for s in fs if s["status_code"] == 200]
         lat = [s["latency_ms"] for s in ok]
-        req_dec = [s["request_decode_ms"] for s in ok]
-        req_decomp = [s["request_decompression_ms"] for s in ok]
-        req_deser = [s["request_deserialization_ms"] for s in ok]
+        db = [s["db_retrieval_ms"] for s in ok]
         ser = [s["serialization_ms"] for s in ok]
         utf8 = [s["utf8_encoding_ms"] for s in ok]
         comp = [s["compression_ms"] for s in ok]
         sproc = [s["server_processing_ms"] for s in ok]
+
         http_stats = compute_stats(lat)
         http_stats["ci_mean_95"] = bootstrap_ci(lat, statistics.mean, seed) if lat else None
         http_stats["ci_p50_95"] = bootstrap_ci(lat, statistics.median, seed + 1) if lat else None
@@ -236,13 +231,12 @@ def run_plain_case(structure, n, encoding, level, repeats, warmup, seed, source_
         comp_b = ok[-1]["compressed_bytes"] if ok else 0
 
         results[fmt] = {
-            "raw_bytes": raw_b, "compressed_bytes": comp_b,
+            "raw_bytes": raw_b,
+            "compressed_bytes": comp_b,
             **size_metrics(raw_b, comp_b),
             "level_used": ok[-1]["level"] if ok else "",
             "http_latency": http_stats,
-            "request_decompression": compute_stats(req_decomp),
-            "request_deserialization": compute_stats(req_deser),
-            "request_decode": compute_stats(req_dec),
+            "db_retrieval": compute_stats(db),
             "serialization": compute_stats(ser),
             "utf8_encoding": compute_stats(utf8),
             "compression": compute_stats(comp),
@@ -257,7 +251,7 @@ def run_plain_case(structure, n, encoding, level, repeats, warmup, seed, source_
         "http_latency_mean": compute_diff(results["json"]["http_latency"]["mean"], results["toon"]["http_latency"]["mean"]),
         "http_latency_p50": compute_diff(results["json"]["http_latency"]["p50"], results["toon"]["http_latency"]["p50"]),
         "http_latency_p95": compute_diff(results["json"]["http_latency"]["p95"], results["toon"]["http_latency"]["p95"]),
-        "request_decode_mean": compute_diff(results["json"]["request_decode"]["mean"], results["toon"]["request_decode"]["mean"]),
+        "db_retrieval_mean": compute_diff(results["json"]["db_retrieval"]["mean"], results["toon"]["db_retrieval"]["mean"]),
         "serialization_mean": compute_diff(results["json"]["serialization"]["mean"], results["toon"]["serialization"]["mean"]),
         "compression_mean": compute_diff(results["json"]["compression"]["mean"], results["toon"]["compression"]["mean"]),
     }
@@ -811,17 +805,15 @@ function render(data) {
   let html = `<p><b>Case:</b> structure=${data.structure}, n=${data.n}, encoding=${data.encoding}${data.level ? ' level='+data.level : ''}, ` +
              `repeats=${data.repeats}, warmup=${data.warmup}, seed=${data.seed}, source=${data.source_mode}, trials=${data.trials}</p>`;
   html += '<table><tr><th>Metric</th><th>JSON</th><th>TOON</th><th>Abs diff</th><th>Improvement</th></tr>';
-  html += statsRow('raw_bytes', r.json.raw_bytes, r.toon.raw_bytes, c.raw_bytes);
-  html += statsRow('compressed_bytes', r.json.compressed_bytes, r.toon.compressed_bytes, c.compressed_bytes);
-  html += statsRow('request_decompression mean_ms', r.json.request_decompression.mean, r.toon.request_decompression.mean, null);
-  html += statsRow('request_deserialization mean_ms', r.json.request_deserialization.mean, r.toon.request_deserialization.mean, null);
-  html += statsRow('request_decode mean_ms', r.json.request_decode.mean, r.toon.request_decode.mean, c.request_decode_mean);
-  html += statsRow('serialization mean_ms', r.json.serialization.mean, r.toon.serialization.mean, c.serialization_mean);
-  html += statsRow('compression mean_ms', r.json.compression.mean, r.toon.compression.mean, c.compression_mean);
-  html += statsRow('server_processing mean_ms', r.json.server_processing.mean, r.toon.server_processing.mean, null);
-  html += statsRow('http_latency MEAN_ms', r.json.http_latency.mean, r.toon.http_latency.mean, c.http_latency_mean);
-  html += statsRow('http_latency p50_ms', r.json.http_latency.p50, r.toon.http_latency.p50, c.http_latency_p50);
-  html += statsRow('http_latency p95_ms', r.json.http_latency.p95, r.toon.http_latency.p95, c.http_latency_p95);
+  html += statsRow('raw bytes', r.json.raw_bytes, r.toon.raw_bytes, c.raw_bytes);
+  html += statsRow('compressed bytes', r.json.compressed_bytes, r.toon.compressed_bytes, c.compressed_bytes);
+  html += statsRow('DB retrieval mean ms', r.json.db_retrieval.mean, r.toon.db_retrieval.mean, c.db_retrieval_mean);
+  html += statsRow('serialization mean ms', r.json.serialization.mean, r.toon.serialization.mean, c.serialization_mean);
+  html += statsRow('compression mean ms', r.json.compression.mean, r.toon.compression.mean, c.compression_mean);
+  html += statsRow('server processing mean ms', r.json.server_processing.mean, r.toon.server_processing.mean, null);
+  html += statsRow('HTTP latency mean ms', r.json.http_latency.mean, r.toon.http_latency.mean, c.http_latency_mean);
+  html += statsRow('HTTP latency p50 ms', r.json.http_latency.p50, r.toon.http_latency.p50, c.http_latency_p50);
+  html += statsRow('HTTP latency p95 ms', r.json.http_latency.p95, r.toon.http_latency.p95, c.http_latency_p95);
   html += '</table>';
   html += `<div class="export-btns">
     <button onclick="exportJson()">Download JSON</button>
@@ -866,8 +858,8 @@ function exportJson() {
 function exportCsv() {
   if (!lastData) return;
   const cols = ['trial','experiment_id','timestamp','structure','n','format','encoding','level',
-                'request_index','request_decode_ms','request_decompression_ms','request_deserialization_ms',
-                'serialization_ms','utf8_encoding_ms','compression_ms','server_processing_ms',
+                'request_index','db_retrieval_ms','serialization_ms','utf8_encoding_ms',
+                'compression_ms','server_processing_ms',
                 'http_latency_ms','raw_bytes','compressed_bytes','status_code','source_db'];
   let csv = cols.join(',') + '\\n';
   const trialList = lastData.trial_results || [{trial_index: 0, samples: lastData.samples}];
@@ -877,8 +869,7 @@ function exportCsv() {
       const row = {
         trial: tr.trial_index, experiment_id: lastData.experiment_id, timestamp: s.timestamp,
         structure: lastData.structure, n: lastData.n, format: s.format, encoding: s.encoding,
-        level: s.level, request_index: s.request_index, request_decode_ms: s.request_decode_ms,
-        request_decompression_ms: s.request_decompression_ms, request_deserialization_ms: s.request_deserialization_ms,
+        level: s.level, request_index: s.request_index, db_retrieval_ms: s.db_retrieval_ms,
         serialization_ms: s.serialization_ms, utf8_encoding_ms: s.utf8_encoding_ms,
         compression_ms: s.compression_ms, server_processing_ms: s.server_processing_ms,
         http_latency_ms: s.latency_ms, raw_bytes: s.raw_bytes, compressed_bytes: s.compressed_bytes,
