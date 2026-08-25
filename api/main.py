@@ -49,9 +49,21 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 DATA_DIR = Path(__file__).parent / "data"
 
 JSON_DB = {}
+TOON_DB = {}
+
 if (DATA_DIR / "dataset_flat.json").exists() and (DATA_DIR / "dataset_nested.json").exists():
     JSON_DB["flat"] = json.loads((DATA_DIR / "dataset_flat.json").read_text())
     JSON_DB["nested"] = json.loads((DATA_DIR / "dataset_nested.json").read_text())
+
+# Canonical TOON source-of-truth, decoded once at startup.
+# Native TOON uses this DB; cross JSON uses this DB as its input.
+if (DATA_DIR / "dataset_flat.toon").exists() and (DATA_DIR / "dataset_nested.toon").exists():
+    TOON_DB["flat"] = toon_cpp.decode_flat(
+        (DATA_DIR / "dataset_flat.toon").read_text()
+    )
+    TOON_DB["nested"] = toon_cpp.decode_nested(
+        (DATA_DIR / "dataset_nested.toon").read_text()
+    )
 
 def _cpp_encode(rows, structure: str) -> str:
     return toon_cpp.encode_flat(rows) if structure == "flat" else toon_cpp.encode_nested(rows)
@@ -119,25 +131,37 @@ async def post_data(request: Request, format: str = Query("json"), encoding: str
                     level: int | None = Query(None), n: int = Query(10), structure: str = Query("flat"),
                     source: str = Query("auto")):
 
-    # --- Phase 1a/1b: Request input ---
+    # --- Phase 1: Select the API-side canonical source ---
     raw_body = await request.body()
     content_encoding = request.headers.get("content-encoding", "").lower()
     content_type = request.headers.get("content-type", "").lower()
 
-    # Native/primary requests use the API's existing canonical database.
-    # The frontend intentionally sends an empty body, avoiding a duplicate
-    # 10k/100k-row dataset in the frontend process.
-    native_db_request = source == "native" and len(raw_body) == 0
+    # The new frontend sends no dataset. The API owns both canonical
+    # representations and selects the source according to the experiment:
+    #
+    # Native: JSON -> JSON_DB, TOON -> TOON_DB
+    # Cross:  JSON -> TOON_DB, TOON -> JSON_DB
+    #
+    # "Cross" therefore means the opposite representation is the source.
+    native_db_request = len(raw_body) == 0
 
     if native_db_request:
         request_decompression_ms = 0.0
         request_deserialization_ms = 0.0
         request_decode_ms = 0.0
-        input_format = format
-        rows = JSON_DB.get(structure, [])
-        src_db = f"native_{format}"
+
+        if source == "cross":
+            input_format = "toon" if format == "json" else "json"
+            rows = TOON_DB.get(structure, []) if input_format == "toon" else JSON_DB.get(structure, [])
+            src_db = f"cross_{input_format}_to_{format}"
+        else:
+            input_format = format
+            rows = JSON_DB.get(structure, []) if format == "json" else TOON_DB.get(structure, [])
+            src_db = f"native_{format}"
+
         del raw_body
     else:
+        # Backward-compatible payload path. The final frontend does not use it.
         t_decomp_start = time.perf_counter()
         try:
             body_bytes = decompress(raw_body, content_encoding)
@@ -146,7 +170,6 @@ async def post_data(request: Request, format: str = Query("json"), encoding: str
         request_decompression_ms = (time.perf_counter() - t_decomp_start) * 1000
         del raw_body
 
-        # --- Phase 1b: Request Deserialization ---
         t_deser_start = time.perf_counter()
         body_str = body_bytes.decode("utf-8")
         input_format = "toon" if ("toon" in content_type or "x-toon" in content_type) else "json"
@@ -166,8 +189,10 @@ async def post_data(request: Request, format: str = Query("json"), encoding: str
 
         src_db = f"cross_{input_format}_to_{format}" if (source == "cross" or input_format != format) else f"native_{format}"
 
-    if isinstance(rows, list) and n < len(rows):
+    if isinstance(rows, list):
         rows = rows[:n]
+
+    request_decode_ms = request_decompression_ms + request_deserialization_ms
 
     # --- Phase 2: Outbound Serialization ---
     t_out_ser = time.perf_counter()
@@ -228,49 +253,76 @@ async def post_cached_data(request: Request, mode: str = Query("json_cache"), fo
                            n: int = Query(10000), structure: str = Query("flat")):
     t0 = time.perf_counter()
     raw_body = await request.body()
-    content_encoding = request.headers.get("content-encoding", "").lower()
-    content_type = request.headers.get("content-type", "").lower()
-    
+
     key = (mode, structure, n)
     hit = key in _CACHE
 
     if mode == "json_cache":
         if not hit:
-            try:
-                body_bytes = decompress(raw_body, content_encoding)
-                rows = _cpp_decode(body_bytes.decode("utf-8"), structure) if "toon" in content_type else json.loads(body_bytes.decode("utf-8"))
-            except Exception:
+            if len(raw_body) == 0:
                 rows = JSON_DB.get(structure, [])[:n] if JSON_DB else []
+            else:
+                content_encoding = request.headers.get("content-encoding", "").lower()
+                content_type = request.headers.get("content-type", "").lower()
+                try:
+                    body_bytes = decompress(raw_body, content_encoding)
+                    text = body_bytes.decode("utf-8")
+                    rows = _cpp_decode(text, structure) if "toon" in content_type else json.loads(text)
+                    del body_bytes
+                    del text
+                except Exception:
+                    rows = JSON_DB.get(structure, [])[:n] if JSON_DB else []
+
             _CACHE[key] = json.dumps(rows).encode("utf-8")
             del rows
-            del body_bytes
+
         body = _CACHE[key]
         media = "application/json"
 
     elif mode == "toon_cache":
         if not hit:
-            try:
-                body_bytes = decompress(raw_body, content_encoding)
-                rows = _cpp_decode(body_bytes.decode("utf-8"), structure) if "toon" in content_type else json.loads(body_bytes.decode("utf-8"))
-            except Exception:
-                rows = JSON_DB.get(structure, [])[:n] if JSON_DB else []
+            if len(raw_body) == 0:
+                rows = TOON_DB.get(structure, [])[:n] if TOON_DB else []
+            else:
+                content_encoding = request.headers.get("content-encoding", "").lower()
+                content_type = request.headers.get("content-type", "").lower()
+                try:
+                    body_bytes = decompress(raw_body, content_encoding)
+                    text = body_bytes.decode("utf-8")
+                    rows = _cpp_decode(text, structure) if "toon" in content_type else json.loads(text)
+                    del body_bytes
+                    del text
+                except Exception:
+                    rows = TOON_DB.get(structure, [])[:n] if TOON_DB else []
+
             _CACHE[key] = _cpp_encode(rows, structure).encode("utf-8")
             del rows
-            del body_bytes
+
         body = _CACHE[key]
         media = "text/toon"
 
     else:  # canonical_cache
         cache_key = ("canonical_toon", structure, n)
         hit = cache_key in _CACHE
+
         if not hit:
-            try:
-                body_bytes = decompress(raw_body, content_encoding)
-                rows = _cpp_decode(body_bytes.decode("utf-8"), structure) if "toon" in content_type else json.loads(body_bytes.decode("utf-8"))
-            except Exception:
-                rows = JSON_DB.get(structure, [])[:n] if JSON_DB else []
+            if len(raw_body) == 0:
+                rows = TOON_DB.get(structure, [])[:n] if TOON_DB else []
+            else:
+                content_encoding = request.headers.get("content-encoding", "").lower()
+                content_type = request.headers.get("content-type", "").lower()
+                try:
+                    body_bytes = decompress(raw_body, content_encoding)
+                    text = body_bytes.decode("utf-8")
+                    rows = _cpp_decode(text, structure) if "toon" in content_type else json.loads(text)
+                    del body_bytes
+                    del text
+                except Exception:
+                    rows = TOON_DB.get(structure, [])[:n] if TOON_DB else []
+
             _CACHE[cache_key] = _cpp_encode(rows, structure).encode("utf-8")
-        
+            del rows
+
         toon_bytes = _CACHE[cache_key]
         if format == "toon":
             body = toon_bytes
@@ -287,7 +339,10 @@ async def post_cached_data(request: Request, mode: str = Query("json_cache"), fo
         "X-Total-Time-Ms": f"{total_ms:.4f}",
         "X-Bytes": str(len(body)),
     }
+
+    del raw_body
     return Response(content=body, media_type=media, headers=headers)
+
 
 @app.post("/cache/clear")
 def clear_cache():

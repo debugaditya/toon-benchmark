@@ -30,33 +30,6 @@ BROTLI_LEVELS = [1, 5, 9, 11]
 MIN_SAMPLES_FOR_CI = 10
 
 
-def generate_dummy_data(structure, n):
-    if structure == "flat":
-        return [
-            {
-                "id": i,
-                "name": f"Record_{i}",
-                "value": i * 1.5,
-                "is_active": i % 2 == 0,
-                "category": "A" if i % 3 == 0 else "B"
-            }
-            for i in range(n)
-        ]
-    else:
-        return [
-            {
-                "id": i,
-                "metadata": {
-                    "name": f"Record_{i}",
-                    "created_at": "2026-01-01T00:00:00Z"
-                },
-                "metrics": [i * 1.0, i * 1.5, i * 2.0],
-                "is_active": i % 2 == 0
-            }
-            for i in range(n)
-        ]
-
-
 def compute_stats(values):
     if not values:
         return {"n": 0, "mean": 0, "stdev": 0, "min": 0, "max": 0, "p50": 0, "p90": 0, "p95": 0, "p99": 0}
@@ -131,62 +104,48 @@ def _do_request(client: httpx.Client, endpoint, fmt, structure, n, encoding, lev
     if level is not None:
         params["level"] = level
 
-    if source_mode == "cross":
-        input_fmt = "toon" if fmt == "json" else "json"
-    else:
-        input_fmt = fmt
 
-    body_bytes = None
-    headers = None
+    body_bytes = b""
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/x-toon" if fmt == "toon" else "application/json"
+    }
     r = None
 
     try:
-        # None means the API must use its existing database.
-        # This is used by the native cache experiment so the frontend
-        # does not create a duplicate 10k/100k-row dataset.
-        if raw_data is None:
-            body_bytes = b""
-            content_type = "application/json"
-        elif input_fmt == "json":
-            body_bytes = json.dumps(raw_data).encode("utf-8")
-            content_type = "application/json"
-        else:
-            body_bytes = (
-                toon_cpp.encode_flat(raw_data)
-                if structure == "flat"
-                else toon_cpp.encode_nested(raw_data)
-            ).encode("utf-8")
-            content_type = "application/x-toon"
-
-        headers = {
-            "Content-Type": content_type,
-            "Accept": "application/x-toon" if fmt == "toon" else "application/json"
-        }
-
-        if encoding == "gzip":
-            body_bytes = gzip.compress(
-                body_bytes, compresslevel=level if level else 9
-            )
-            headers["Content-Encoding"] = "gzip"
-        elif encoding in ("brotli", "br"):
-            body_bytes = brotli.compress(
-                body_bytes, quality=level if level else 5
-            )
-            headers["Content-Encoding"] = "br"
-
+        # The API owns the canonical benchmark dataset. The frontend never
+        # generates or sends a duplicate 10k/100k-row payload.
         t0 = time.perf_counter()
         ts = datetime.now(timezone.utc).isoformat()
 
         try:
-            r = client.post(
+            # Stream the response. We need to consume the full body so the
+            # measured HTTP latency includes transfer time, but we do not
+            # retain a 100k-record response in frontend memory.
+            with client.stream(
+                "POST",
                 f"{API_BASE_URL}{endpoint}",
                 params=params,
                 content=body_bytes,
                 headers=headers
-            )
-            latency_ms = (time.perf_counter() - t0) * 1000
+            ) as r:
+                if r.status_code >= 400:
+                    error_chunks = []
+                    error_size = 0
+                    for chunk in r.iter_bytes():
+                        if error_size < 4096:
+                            take = chunk[:4096 - error_size]
+                            error_chunks.append(take)
+                            error_size += len(take)
+                    error_text = b"".join(error_chunks).decode("utf-8", errors="replace")
+                    raise RuntimeError(f"HTTP {r.status_code}: {error_text[:1000]}")
 
-            result = {
+                for _chunk in r.iter_bytes():
+                    pass
+
+                latency_ms = (time.perf_counter() - t0) * 1000
+
+                result = {
                 "timestamp": ts, "format": fmt,
                 "latency_ms": round(latency_ms, 3),
                 "cache_hit": r.headers.get("x-cache-hit") == "true",
@@ -240,9 +199,8 @@ def _do_request(client: httpx.Client, endpoint, fmt, structure, n, encoding, lev
 def run_plain_case(structure, n, encoding, level, repeats, warmup, seed, source_mode):
     order, pair_directions = build_paired_order(repeats, seed)
     warmup_order, _ = build_paired_order(warmup, seed + 1) if warmup > 0 else ([], [])
-    # Native/primary benchmarks use the API's existing 100k-row database.
-    # Only cross-mode benchmarks need a frontend-generated payload.
-    raw_data = generate_dummy_data(structure, n) if source_mode == "cross" else None
+    # Dataset lives exclusively on the API side.
+    raw_data = None
 
     with httpx.Client(timeout=180) as client:
         for fmt in warmup_order:
@@ -573,8 +531,8 @@ INDEX_HTML = """
     <label>Database source</label>
     <select id="sourceMode">
       <option value="native">Native (primary)</option>
-      <option value="cross">Cross (translation/conversion)</option>
-    </select>
+      <option value="cross">Cross (opposite DB)</option>
+          </select>
   </div>
   <div class="field" id="modeField" style="display:none">
     <label>Cache mode</label>
