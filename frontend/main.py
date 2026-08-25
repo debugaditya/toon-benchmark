@@ -117,7 +117,7 @@ def build_paired_order(repeats, seed):
     return order, pair_directions
 
 
-def _do_request(client: httpx.Client, endpoint, fmt, structure, n, encoding, level, source_mode, raw_data, cache_mode=None):
+def _do_request(client: httpx.Client, endpoint, fmt, structure, n, encoding, level, source_mode, raw_data=None, cache_mode=None):
     params = {
         "format": fmt,
         "encoding": encoding,
@@ -141,7 +141,13 @@ def _do_request(client: httpx.Client, endpoint, fmt, structure, n, encoding, lev
     r = None
 
     try:
-        if input_fmt == "json":
+        # None means the API must use its existing database.
+        # This is used by the native cache experiment so the frontend
+        # does not create a duplicate 10k/100k-row dataset.
+        if raw_data is None:
+            body_bytes = b""
+            content_type = "application/json"
+        elif input_fmt == "json":
             body_bytes = json.dumps(raw_data).encode("utf-8")
             content_type = "application/json"
         else:
@@ -234,7 +240,9 @@ def _do_request(client: httpx.Client, endpoint, fmt, structure, n, encoding, lev
 def run_plain_case(structure, n, encoding, level, repeats, warmup, seed, source_mode):
     order, pair_directions = build_paired_order(repeats, seed)
     warmup_order, _ = build_paired_order(warmup, seed + 1) if warmup > 0 else ([], [])
-    raw_data = generate_dummy_data(structure, n)
+    # Native/primary benchmarks use the API's existing 100k-row database.
+    # Only cross-mode benchmarks need a frontend-generated payload.
+    raw_data = generate_dummy_data(structure, n) if source_mode == "cross" else None
 
     with httpx.Client(timeout=180) as client:
         for fmt in warmup_order:
@@ -301,7 +309,10 @@ def run_plain_case(structure, n, encoding, level, repeats, warmup, seed, source_
 
 
 def run_cache_case(mode, structure, n, repeats, warmup, seed):
-    raw_data = generate_dummy_data(structure, n)
+    # The API already owns the 100k-row benchmark database.
+    # Native cache experiments must use that DB instead of generating
+    # another copy of n rows on the frontend.
+    raw_data = None
 
     with httpx.Client(timeout=180) as client:
         cache_miss_latency_ms = {}
@@ -473,6 +484,8 @@ def run_research(repeats: int = Query(15), warmup: int = Query(3), seed: int = Q
                 # Release the per-case local reference before starting the next case.
                 del res
             else:
+                # Cache cases use the API's existing database; no frontend
+                # dataset is created for these cases.
                 res = run_cache_case(case["mode"], case["structure"], case["n"], repeats, warmup, seed)
                 all_results.append({**case, **res})
         except Exception as e:

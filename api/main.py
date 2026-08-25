@@ -119,38 +119,52 @@ async def post_data(request: Request, format: str = Query("json"), encoding: str
                     level: int | None = Query(None), n: int = Query(10), structure: str = Query("flat"),
                     source: str = Query("auto")):
 
-    # --- Phase 1a: Request Decompression ---
-    t_decomp_start = time.perf_counter()
+    # --- Phase 1a/1b: Request input ---
     raw_body = await request.body()
     content_encoding = request.headers.get("content-encoding", "").lower()
     content_type = request.headers.get("content-type", "").lower()
-    
-    try:
-        body_bytes = decompress(raw_body, content_encoding)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Request decompression failed: {e}")
-    request_decompression_ms = (time.perf_counter() - t_decomp_start) * 1000
-    del raw_body
 
-    # --- Phase 1b: Request Deserialization ---
-    t_deser_start = time.perf_counter()
-    body_str = body_bytes.decode("utf-8")
-    input_format = "toon" if ("toon" in content_type or "x-toon" in content_type) else "json"
-    
-    try:
-        if input_format == "toon":
-            rows = _cpp_decode(body_str, structure)
-        else:
-            rows = json.loads(body_str)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Request deserialization failed ({input_format}): {e}")
-        
-    request_deserialization_ms = (time.perf_counter() - t_deser_start) * 1000
-    request_decode_ms = request_decompression_ms + request_deserialization_ms
-    del body_str
-    del body_bytes
+    # Native/primary requests use the API's existing canonical database.
+    # The frontend intentionally sends an empty body, avoiding a duplicate
+    # 10k/100k-row dataset in the frontend process.
+    native_db_request = source == "native" and len(raw_body) == 0
 
-    src_db = f"cross_{input_format}_to_{format}" if (source == "cross" or input_format != format) else f"native_{format}"
+    if native_db_request:
+        request_decompression_ms = 0.0
+        request_deserialization_ms = 0.0
+        request_decode_ms = 0.0
+        input_format = format
+        rows = JSON_DB.get(structure, [])
+        src_db = f"native_{format}"
+        del raw_body
+    else:
+        t_decomp_start = time.perf_counter()
+        try:
+            body_bytes = decompress(raw_body, content_encoding)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Request decompression failed: {e}")
+        request_decompression_ms = (time.perf_counter() - t_decomp_start) * 1000
+        del raw_body
+
+        # --- Phase 1b: Request Deserialization ---
+        t_deser_start = time.perf_counter()
+        body_str = body_bytes.decode("utf-8")
+        input_format = "toon" if ("toon" in content_type or "x-toon" in content_type) else "json"
+
+        try:
+            if input_format == "toon":
+                rows = _cpp_decode(body_str, structure)
+            else:
+                rows = json.loads(body_str)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Request deserialization failed ({input_format}): {e}")
+
+        request_deserialization_ms = (time.perf_counter() - t_deser_start) * 1000
+        request_decode_ms = request_decompression_ms + request_deserialization_ms
+        del body_str
+        del body_bytes
+
+        src_db = f"cross_{input_format}_to_{format}" if (source == "cross" or input_format != format) else f"native_{format}"
 
     if isinstance(rows, list) and n < len(rows):
         rows = rows[:n]
