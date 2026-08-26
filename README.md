@@ -1340,6 +1340,476 @@ The complete experiment source and benchmark implementation are available at:
 **Experiment Setup:**  
 https://github.com/debugaditya/toon-benchmark
 
+
+# 32. Clone and Deploy the Benchmark
+
+This section describes the recommended deployment procedure for reproducing the deployed benchmark.
+
+The repository contains **two Render web services**:
+
+```text
+toon-benchmark-api
+        │
+        │ HTTP API
+        ▼
+toon-benchmark-frontend
+        │
+        ▼
+Benchmark Dashboard
+```
+
+Both services are configured for the **Singapore** region in `render.yaml`.
+
+The repository is designed to be deployed as a **Render Blueprint** first. After the Blueprint creates both services, upgrade **both services to the Pro plan** before running the final research benchmark.
+
+---
+
+## 32.1 Clone the Repository
+
+Clone the experiment repository:
+
+```bash
+git clone https://github.com/debugaditya/toon-benchmark.git
+```
+
+Enter the repository:
+
+```bash
+cd toon-benchmark
+```
+
+The repository should contain the deployment configuration:
+
+```text
+toon-benchmark/
+├── deploy/
+├── render.yaml
+├── README.md
+└── ...
+```
+
+The `render.yaml` file defines the two services required by the benchmark.
+
+---
+
+## 32.2 Deploy Using the Render Blueprint
+
+The easiest way to deploy the complete system is to use the Blueprint defined by:
+
+```text
+render.yaml
+```
+
+In Render:
+
+1. Open the Render dashboard.
+2. Select **New**.
+3. Select **Blueprint**.
+4. Connect the GitHub repository:
+
+```text
+debugaditya/toon-benchmark
+```
+
+5. Select the repository.
+6. Select the branch containing `render.yaml`.
+7. Review the two services detected from the Blueprint.
+8. Apply/create the Blueprint.
+
+The Blueprint creates:
+
+```text
+toon-benchmark-api
+toon-benchmark-frontend
+```
+
+Both services are initially declared with:
+
+```yaml
+plan: free
+```
+
+This is intentional so that the Blueprint can create the complete deployment from the repository configuration.
+
+---
+
+## 32.3 Upgrade Both Services to Pro
+
+After the Blueprint has successfully created both services, upgrade:
+
+```text
+toon-benchmark-api
+```
+
+and
+
+```text
+toon-benchmark-frontend
+```
+
+to the **Pro** plan.
+
+The final research measurements should not be collected from the free-tier instances.
+
+The final benchmark used stable Pro-tier infrastructure because constrained/shared resources can introduce additional variability into:
+
+- CPU time
+- compression time
+- serialization time
+- HTTP latency
+- tail latency
+- cache behavior
+
+Therefore the intended research deployment is:
+
+```text
+                 Singapore region
+                       │
+             ┌─────────┴─────────┐
+             │                   │
+             ▼                   ▼
+       API — Pro tier      Frontend — Pro tier
+             │                   │
+             └────── HTTP ───────┘
+```
+
+---
+
+## 32.4 Configure the Frontend with the Backend URL
+
+The frontend needs to know where the API service is running.
+
+The API service created by Render receives its own public URL, for example:
+
+```text
+https://toon-benchmark-api-3zli.onrender.com
+```
+
+That URL must be supplied to the frontend through:
+
+```text
+API_BASE_URL
+```
+
+The corresponding section of `render.yaml` is:
+
+```yaml
+  - type: web
+    name: toon-benchmark-frontend
+    runtime: python
+    plan: free
+    region: singapore
+    rootDir: frontend
+    buildCommand: pip install -r requirements.txt && cd toon_cpp && python setup.py build_ext --inplace && cp toon_cpp*.so .. && cd .. && python -c "import toon_cpp; print('TOON MODULE:', toon_cpp.__file__); print('TOON ATTRS:', [x for x in dir(toon_cpp) if 'encode' in x]); assert hasattr(toon_cpp, 'encode_flat'); assert hasattr(toon_cpp, 'encode_nested')"
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: API_BASE_URL
+        value: https://toon-benchmark-api-3zli.onrender.com
+```
+
+### Important
+
+The URL above is the backend URL used in the documented deployment configuration.
+
+If Render assigns a different URL to the newly created API service, replace:
+
+```yaml
+value: https://toon-benchmark-api-3zli.onrender.com
+```
+
+with the actual URL of:
+
+```text
+toon-benchmark-api
+```
+
+Do **not** put the frontend URL in `API_BASE_URL`.
+
+The relationship must be:
+
+```text
+API_BASE_URL
+      │
+      ▼
+toon-benchmark-api
+```
+
+not:
+
+```text
+API_BASE_URL
+      │
+      ▼
+toon-benchmark-frontend
+```
+
+---
+
+## 32.5 Render Service Configuration
+
+The API service is defined by the following deployment configuration:
+
+```yaml
+services:
+  - type: web
+    name: toon-benchmark-api
+    runtime: python
+    plan: free
+    region: singapore
+    rootDir: api
+    buildCommand: pip install -r requirements.txt && cd toon_cpp && python setup.py build_ext --inplace && cp toon_cpp*.so .. && cd .. && python -c "import toon_cpp; print('TOON MODULE:', toon_cpp.__file__); print('TOON ATTRS:', [x for x in dir(toon_cpp) if 'encode' in x]); assert hasattr(toon_cpp, 'encode_flat'); assert hasattr(toon_cpp, 'encode_nested')"
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+```
+
+The frontend service is:
+
+```yaml
+  - type: web
+    name: toon-benchmark-frontend
+    runtime: python
+    plan: free
+    region: singapore
+    rootDir: frontend
+    buildCommand: pip install -r requirements.txt && cd toon_cpp && python setup.py build_ext --inplace && cp toon_cpp*.so .. && cd .. && python -c "import toon_cpp; print('TOON MODULE:', toon_cpp.__file__); print('TOON ATTRS:', [x for x in dir(toon_cpp) if 'encode' in x]); assert hasattr(toon_cpp, 'encode_flat'); assert hasattr(toon_cpp, 'encode_nested')"
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: API_BASE_URL
+        value: https://toon-benchmark-api-3zli.onrender.com
+```
+
+The `plan: free` values in the repository are the initial Blueprint configuration. For the research deployment, both services should subsequently be upgraded to Pro in Render.
+
+---
+
+## 32.6 What the Build Command Does
+
+The build command performs several operations.
+
+First, it installs the Python dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+It then enters the native serializer directory:
+
+```bash
+cd toon_cpp
+```
+
+and builds the C++ Python extension:
+
+```bash
+python setup.py build_ext --inplace
+```
+
+The compiled extension is then copied into the service directory:
+
+```bash
+cp toon_cpp*.so ..
+```
+
+This makes the native module importable by the Python API.
+
+Finally, the deployment runs an explicit verification step:
+
+```python
+import toon_cpp
+print('TOON MODULE:', toon_cpp.__file__)
+print('TOON ATTRS:', [x for x in dir(toon_cpp) if 'encode' in x])
+assert hasattr(toon_cpp, 'encode_flat')
+assert hasattr(toon_cpp, 'encode_nested')
+```
+
+This is important because the benchmark depends on the native C++ implementation.
+
+The deployment should fail rather than silently continue if either required encoder is unavailable.
+
+---
+
+## 32.7 Start Command and Health Check
+
+Both services are started with Uvicorn:
+
+```bash
+uvicorn main:app --host 0.0.0.0 --port $PORT
+```
+
+Render supplies the `$PORT` environment variable.
+
+The deployment also exposes:
+
+```text
+/health
+```
+
+as the health-check endpoint.
+
+A successful health check confirms that the service is running and reachable by the deployment platform.
+
+---
+
+## 32.8 Verify the Deployment
+
+After deployment, verify the backend first.
+
+Open the backend service URL:
+
+```text
+https://toon-benchmark-api-3zli.onrender.com
+```
+
+Then check:
+
+```text
+https://toon-benchmark-api-3zli.onrender.com/health
+```
+
+The health endpoint should respond successfully.
+
+Next open the frontend service URL.
+
+The dashboard should load and allow benchmark configuration.
+
+Before collecting research measurements, verify that:
+
+```text
+Frontend
+   │
+   │ API_BASE_URL
+   ▼
+Backend
+   │
+   ├── dataset loading
+   ├── JSON serialization
+   ├── native C++ TOON serialization
+   ├── Brotli compression
+   ├── timing instrumentation
+   └── benchmark response
+```
+
+is functioning correctly.
+
+---
+
+## 32.9 Final Research Deployment Checklist
+
+Before running the final experiment, confirm all of the following:
+
+- [ ] Repository cloned from `debugaditya/toon-benchmark`
+- [ ] Render Blueprint deployed successfully
+- [ ] `toon-benchmark-api` exists
+- [ ] `toon-benchmark-frontend` exists
+- [ ] Both services are in the Singapore region
+- [ ] Both services have been upgraded to Pro
+- [ ] Backend `/health` endpoint is healthy
+- [ ] Native `toon_cpp` extension builds successfully
+- [ ] `encode_flat` exists
+- [ ] `encode_nested` exists
+- [ ] Frontend `API_BASE_URL` points to the backend
+- [ ] Frontend can successfully communicate with the API
+- [ ] Benchmark dashboard loads
+- [ ] Dataset generation/loading is working
+- [ ] Warm-up configuration is set correctly
+- [ ] Repetitions are set to 100
+- [ ] Seed is set to 42
+- [ ] Persistent HTTP connection is used
+- [ ] Final measurements are collected only after deployment is stable
+
+---
+
+## 32.10 Running the Research Benchmark After Deployment
+
+Once deployment is verified, use the dashboard to run the experimental matrix.
+
+For format/compression experiments, configure:
+
+```text
+Records:       100,000
+Warm-up:       3
+Repeats:       100
+Trials:        1
+Seed:          42
+```
+
+Run the required combinations of:
+
+```text
+Flat
+Nested
+```
+
+with:
+
+```text
+Identity
+Brotli 5
+Brotli 9
+Brotli 11
+```
+
+and:
+
+```text
+Native
+Cross
+```
+
+as specified by the experimental matrix.
+
+Then run the cache configurations separately.
+
+The benchmark dashboard provides downloadable JSON and CSV outputs for retaining the raw measurements.
+
+---
+
+## 32.11 Deployment Architecture Summary
+
+The complete deployment can be summarized as:
+
+```text
+                         GitHub Repository
+                                │
+                                ▼
+                         Render Blueprint
+                                │
+                 ┌──────────────┴──────────────┐
+                 │                             │
+                 ▼                             ▼
+       toon-benchmark-api            toon-benchmark-frontend
+          Singapore / Pro               Singapore / Pro
+                 │                             │
+                 │                             │
+                 │       API_BASE_URL           │
+                 └─────────────────────────────┘
+                                │
+                                ▼
+                         Benchmark API
+                                │
+              ┌─────────────────┼─────────────────┐
+              │                 │                 │
+              ▼                 ▼                 ▼
+           Dataset         C++ TOON          Brotli
+           Retrieval       Serializer       Compression
+              │                 │                 │
+              └─────────────────┼─────────────────┘
+                                ▼
+                         Timing Instrumentation
+                                │
+                                ▼
+                          HTTP Response
+                                │
+                                ▼
+                         Dashboard Results
+```
+
+This architecture keeps the benchmark frontend and API as separate services while allowing the frontend to communicate with the backend through the configurable `API_BASE_URL`.
+
+The separation also makes it possible to independently scale or replace either component without changing the core experimental methodology.
+
 ---
 
 ## License / Usage
