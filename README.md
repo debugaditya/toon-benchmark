@@ -1482,7 +1482,7 @@ The frontend needs to know where the API service is running.
 The API service created by Render receives its own public URL, for example:
 
 ```text
-https://toon-benchmark-api-3zli.onrender.com
+API_BASE_URL.com
 ```
 
 That URL must be supplied to the frontend through:
@@ -1505,7 +1505,7 @@ The corresponding section of `render.yaml` is:
     healthCheckPath: /health
     envVars:
       - key: API_BASE_URL
-        value: https://toon-benchmark-api-3zli.onrender.com
+        value: API_BASE_URL.com
 ```
 
 ### Important
@@ -1515,7 +1515,7 @@ The URL above is the backend URL used in the documented deployment configuration
 If Render assigns a different URL to the newly created API service, replace:
 
 ```yaml
-value: https://toon-benchmark-api-3zli.onrender.com
+value: API_BASE_URL.com
 ```
 
 with the actual URL of:
@@ -1577,7 +1577,7 @@ The frontend service is:
     healthCheckPath: /health
     envVars:
       - key: API_BASE_URL
-        value: https://toon-benchmark-api-3zli.onrender.com
+        value: API_BASE_URL.com
 ```
 
 The `plan: free` values in the repository are the initial Blueprint configuration. For the research deployment, both services should subsequently be upgraded to Pro in Render.
@@ -1659,13 +1659,13 @@ After deployment, verify the backend first.
 Open the backend service URL:
 
 ```text
-https://toon-benchmark-api-3zli.onrender.com
+API_BASE_URL.com
 ```
 
 Then check:
 
 ```text
-https://toon-benchmark-api-3zli.onrender.com/health
+API_BASE_URL.com/health
 ```
 
 The health endpoint should respond successfully.
