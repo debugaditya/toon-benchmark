@@ -1,525 +1,873 @@
-TOON vs JSON Benchmark
+# TOON vs JSON Benchmark
 
-Experimental Evaluation of Serialization, Compression, Caching, and End-to-End HTTP Performance
+## Experimental Evaluation of Serialization, Compression, Caching, and End-to-End HTTP Performance
 
-This repository contains the experimental implementation and benchmark artifacts for evaluating TOON (Token-Oriented Object Notation) against JSON for structured API responses.
+[![Language: C++](https://img.shields.io/badge/serializer-C%2B%2B-blue.svg)](https://isocpp.org/)
+[![Language: Python](https://img.shields.io/badge/API-Python-yellow.svg)](https://www.python.org/)
+[![Benchmark](https://img.shields.io/badge/benchmark-100%2C000%20records-informational.svg)](https://github.com/debugaditya/toon-benchmark)
 
-The experiment investigates whether TOON's compact representation translates into practical systems-level benefits when serialization, compression, server-side processing, HTTP delivery, and caching are considered together.
+This repository contains the complete implementation and experimental artifacts for a systems-level comparison of **JSON** and **TOON (Token-Oriented Object Notation)** as API response formats.
 
-The benchmark was designed to evaluate more than serialized byte count. It measures the serving pipeline and studies how the relative advantage changes with data structure, compression level, source condition, and caching.
+The project was built to answer a more useful question than simply *"Which format produces fewer bytes?"*
 
-Author
+> **When serialization, compression, server processing, caching, and HTTP delivery are considered together, does TOON's structural compactness produce a measurable end-to-end performance advantage over JSON?**
 
-Aditya Narayan Barmola
-Netaji Subhas University of Technology (NSUT)
+The benchmark deliberately measures the complete serving path. It also separates the effects of **representation size** from the cost of **encoding and compression**, because a smaller representation does not automatically imply a faster implementation.
+
+---
+
+## Author
+
+**Aditya Narayan Barmola**  
+**Netaji Subhas University of Technology (NSUT)**  
 New Delhi, India
 
-Email: adibarmola@gmail.com
+**Email:** `adibarmola@gmail.com`
 
-Experiment Setup:
+**Experiment Setup:**  
 https://github.com/debugaditya/toon-benchmark
 
-1. Research Objective
+---
 
-Modern APIs commonly use JSON because of its interoperability, mature tooling, and widespread adoption. However, JSON repeatedly encodes structural information such as object keys and delimiters.
+# 1. Research Overview
 
-TOON represents structured tabular data using a more compact schema-oriented representation.
+JSON is the dominant interchange format for web APIs because it is simple, interoperable, human-readable, and supported by practically every programming ecosystem. Its representation, however, repeatedly stores object keys and structural delimiters for every record.
 
-A flat workload in this experiment is represented as:
+TOON takes a schema-oriented approach for regular structured data. Instead of repeating the same field names for every object, the schema is declared once and the records are represented as compact rows.
 
+For example, the flat benchmark workload uses the logical schema:
+
+```text
 [100000]{id,name,age,city}:
-  1,QAHFTR,52,Mumbai
-  2,PACGPO,63,Bhopal
-  3,KLHWTE,45,Kolkata
+```
 
-A nested workload is represented as:
+with records such as:
 
+```text
+1,QAHFTR,52,Mumbai
+2,PACGPO,63,Bhopal
+3,KLHWTE,45,Kolkata
+4,HFTCJJ,40,Surat
+5,GBLDXC,36,Surat
+```
+
+The nested workload uses:
+
+```text
 [100000]{id,name,address{city,zip},tags}:
-  1,QAHFTR,{Bhopal,191161},[2]{trial,vip}
-  2,AFNAFQ,{Bhopal,539898},null
+```
 
-The central research question is:
+with records such as:
 
-Does TOON's reduction in representation size translate into better real-world API performance once serialization, compression, server processing, and HTTP delivery are included?
+```text
+1,QAHFTR,{Bhopal,191161},[2]{trial,vip}
+2,AFNAFQ,{Bhopal,539898},null
+3,FPVAUS,{Kolkata,391369},[2]{new,vip}
+4,YICCWP,{Delhi,865179},null
+```
 
-A second question is:
+The experiment therefore studies both a regular tabular workload and a more structurally demanding nested workload.
 
-Does TOON remain advantageous after general-purpose compression reduces much of the representation-level redundancy?
+---
 
-The experiment also evaluates whether caching exposes a stronger benefit from TOON's compact representation by removing expensive generation work from repeated requests.
+# 2. What This Project Is Trying to Measure
 
-2. What This Repository Contains
+The benchmark is intentionally **pipeline-oriented**.
 
-The repository contains:
+A response does not simply go from a database to a byte count. In the deployed experiment, the request passes through several stages:
 
-benchmark API server
+```text
+Database retrieval
+       ↓
+Data representation / serialization
+       ↓
+Optional compression
+       ↓
+Server-side processing and encoding overhead
+       ↓
+HTTP response
+       ↓
+Client-observed latency
+```
 
-native C++ TOON serializer
+For cached responses, the path changes because previously generated response material can be served without repeating the complete generation pipeline.
 
-Python/C++ integration through a compiled extension
+The benchmark therefore measures:
 
-flat and nested datasets
+- payload size
+- compressed payload size
+- database retrieval time
+- serialization time
+- compression time
+- server processing time
+- complete HTTP latency
+- HTTP p50 latency
+- HTTP p95 latency
+- cache miss latency
+- warm-cache latency distribution
+- cache hit rate
+- cache variability
 
-JSON and TOON source files
+This allows the experiment to distinguish between:
 
-Brotli compression experiments
+**Representation efficiency**
 
-cache-layer experiments
+and
 
-Native and Cross-source experiments
+**implementation efficiency**
 
-benchmark result generation
+and finally determine whether either advantage survives at the **end-to-end HTTP level**.
 
-CSV/JSON result export
+---
 
-frontend benchmark dashboard
+# 3. Research Questions
 
-research result figures
+The experiment is organized around the following questions.
 
-LaTeX research-paper source
+### RQ1 — Payload compactness
 
-The repository is intended to make the experimental implementation inspectable rather than presenting only the final measurements.
+Does TOON reduce the number of bytes required to represent the same 100,000 logical records compared with JSON?
 
-3. Experimental Design
+### RQ2 — Post-compression compactness
 
-The benchmark compares:
+After applying Brotli compression, how much of TOON's original byte advantage remains?
 
-Formats
+The experiment evaluates:
 
-JSON
+- Identity / no compression
+- Brotli 5
+- Brotli 9
+- Brotli 11
 
-TOON
+### RQ3 — Serialization cost
 
-Workload structures
+Does the native C++ TOON serializer require more or less time than JSON serialization?
 
-Flat
+Does this difference depend on whether the workload is flat or nested?
 
-Nested
+### RQ4 — Compression cost
 
-Compression
+Does the smaller TOON input reduce compression work enough to offset any additional serialization cost?
 
-Identity / no compression
+### RQ5 — End-to-end latency
 
-Brotli 5
+When database retrieval, serialization, compression, server-side overhead, and HTTP delivery are considered together, does TOON reduce mean, p50, and p95 latency?
 
-Brotli 9
+### RQ6 — Source robustness
 
-Brotli 11
+Do the conclusions remain consistent when the requested output format is produced from the **opposite source representation** rather than its normal/native source?
 
-Source modes
+### RQ7 — Cache behavior
 
-Native (primary)
+When responses are already materialized in a cache, does TOON's smaller representation produce an even stronger serving advantage?
 
-Cross (opposite DB)
+---
 
-Cache modes
+# 4. Experimental Hypotheses
 
-Canonical cache
+The benchmark was designed around several competing effects rather than assuming that TOON must win every metric.
 
-Native cache
+### H1 — Spatial compactness
 
-Each format/compression configuration uses the same logical dataset and benchmark conditions.
+TOON should substantially reduce raw payload size because repeated field names and structural syntax are represented once at the schema level.
 
-4. Dataset
+### H2 — Compression convergence
 
-Each workload contains exactly:
+General-purpose compression should reduce the absolute difference between JSON and TOON because compressors can exploit repeated JSON structure as well.
 
+Therefore, the percentage byte advantage after compression is expected to be smaller than the raw-byte advantage.
+
+### H3 — Structure-dependent serialization
+
+A specialized C++ TOON encoder should be competitive on regular flat records but may incur greater overhead on nested objects, arrays, null handling, and dynamic memory operations.
+
+### H4 — Compression-cost crossover
+
+At higher Brotli levels, the computational cost of compression may dominate the request. TOON's smaller input may then reduce compression work enough to compensate for serialization overhead.
+
+### H5 — End-to-end transport benefit
+
+If the reduction in transmitted bytes is sufficiently large, TOON should reduce complete HTTP latency even when its serializer is slower.
+
+### H6 — Cross-source robustness
+
+If the TOON advantage remains when the output format is generated from the opposite source representation, the result is less likely to be caused simply by source-format locality.
+
+### H7 — Cache amplification
+
+When serialization and compression are removed or amortized by caching, TOON's compact representation should become more directly visible in cache-serving latency and bandwidth-related behavior.
+
+---
+
+# 5. Experimental Matrix
+
+The format/compression benchmark varies four major dimensions.
+
+| Dimension | Values |
+|---|---|
+| Format | JSON, TOON |
+| Structure | Flat, Nested |
+| Compression | Identity, Brotli 5, Brotli 9, Brotli 11 |
+| Source | Native (primary), Cross (opposite DB) |
+
+This produces the complete format/compression matrix used in the final research collection.
+
+A separate cache matrix evaluates:
+
+| Cache dimension | Values |
+|---|---|
+| Structure | Flat, Nested |
+| Cache mode | Canonical cache, Native cache |
+| Format | JSON, TOON |
+
+---
+
+# 6. Dataset Design
+
+Every benchmark workload contains exactly:
+
+```text
 100,000 records
+```
 
-Two structures are evaluated.
+The datasets are generated deterministically and stored as JSON and TOON source files.
 
-4.1 Flat Dataset
+## 6.1 Flat schema
 
-Schema:
-
-[100000]{id,name,age,city}
-
-Example:
-
+```text
 [100000]{id,name,age,city}:
-  1,QAHFTR,52,Mumbai
-  2,PACGPO,63,Bhopal
-  3,KLHWTE,45,Kolkata
-  4,HFTCJJ,40,Surat
-  5,GBLDXC,36,Surat
+```
 
-The flat workload represents a regular tabular API response with repeated fields and minimal nesting.
+Representative data:
 
-4.2 Nested Dataset
+```text
+1,QAHFTR,52,Mumbai
+2,PACGPO,63,Bhopal
+3,KLHWTE,45,Kolkata
+4,HFTCJJ,40,Surat
+5,GBLDXC,36,Surat
+6,XJEBRU,23,Pune
+7,WJLVEJ,60,Jaipur
+8,SRBQNG,47,Nagpur
+9,HYRFIT,21,Pune
+10,VUKBXO,63,Kolkata
+```
 
-Schema:
+The flat dataset isolates the benefits of schema-level compactness in a highly regular record layout.
 
-[100000]{id,name,address{city,zip},tags}
+## 6.2 Nested schema
 
-Example:
-
+```text
 [100000]{id,name,address{city,zip},tags}:
-  1,QAHFTR,{Bhopal,191161},[2]{trial,vip}
-  2,AFNAFQ,{Bhopal,539898},null
-  3,FPVAUS,{Kolkata,391369},[2]{new,vip}
-  4,YICCWP,{Delhi,865179},null
+```
 
-The nested workload introduces nested objects, arrays, and nullable values. It therefore provides a more demanding test of the TOON encoder.
+Representative data:
 
-5. TOON Serializer
+```text
+1,QAHFTR,{Bhopal,191161},[2]{trial,vip}
+2,AFNAFQ,{Bhopal,539898},null
+3,FPVAUS,{Kolkata,391369},[2]{new,vip}
+4,YICCWP,{Delhi,865179},null
+5,LDXCHQ,{Kolkata,705397},null
+6,EBRUZW,{Mumbai,498591},[2]{flagged,new}
+7,QJJFGY,{Mumbai,738720},null
+8,QNGMHY,{Bhopal,330283},null
+```
 
-The benchmark uses a native C++ TOON serializer exposed to the Python API through a compiled Python extension.
+The nested workload deliberately introduces:
 
-The serializer was implemented and optimized for the structured data used in this experiment. This was done to avoid comparing a native JSON implementation against an artificially slow Python-level TOON prototype.
+- nested objects
+- arrays
+- nullable fields
+- additional structural traversal
+- more complex memory handling
 
-The implementation should therefore be understood as a workload-specialized C++ TOON encoder. The reported serialization numbers characterize the implementation used in this study and do not represent a theoretical upper bound for every possible TOON implementation.
+This makes it useful for testing whether TOON's compact representation remains advantageous when encoding itself becomes more complicated.
 
-Relevant files include:
+---
 
-deploy/api/toon_cpp/
-├── toon_cpp.cpp
-├── setup.py
-├── pyproject.toml
-└── toon_cpp*.pyd
+# 7. TOON Serializer Implementation
 
-6. System Architecture
+A central design decision was to use a **native C++ TOON serializer** rather than a slow Python reference implementation.
 
-The experimental serving path is conceptually:
+The serializer is exposed to the Python API through a compiled Python extension.
 
-                 ┌──────────────────────────┐
-                 │      Benchmark Client    │
-                 │ randomized request pairs │
-                 └────────────┬─────────────┘
-                              │
-                              │ HTTP
-                              ▼
-                 ┌──────────────────────────┐
-                 │       API Service        │
-                 │         main.py          │
-                 └────────────┬─────────────┘
-                              │
-              ┌───────────────┼────────────────┐
-              │               │                │
-              ▼               ▼                ▼
-       ┌─────────────┐ ┌──────────────┐ ┌─────────────┐
-       │ DB Retrieval│ │ Serialization│ │ Compression │
-       └─────────────┘ └──────┬───────┘ └─────────────┘
-                              │
-                       ┌──────▼──────┐
-                       │ TOON C++    │
-                       │ Serializer  │
-                       └─────────────┘
-                              │
-                              ▼
-                         HTTP Response
+```text
+Python API
+    │
+    │ Python/C++ extension
+    ▼
+Native C++ TOON encoder
+    │
+    ▼
+TOON byte/string representation
+```
 
-The deployment used stable Render Pro-tier infrastructure for the final research collection. The benchmark was run server-side against the deployed API service using a persistent HTTP connection.
+The implementation was optimized specifically for the structured benchmark data used in this study.
 
-7. API Service
+This matters for fairness.
 
-The API entry point is:
+A benchmark comparing a production-style JSON implementation against an intentionally slow prototype encoder would measure implementation quality rather than format behavior. The C++ implementation therefore attempts to provide a practical TOON serving path for the chosen workload.
 
+At the same time, this means that the serialization measurements should be interpreted as measurements of the **implemented C++ TOON encoder**, not as a universal upper bound on TOON's possible performance.
+
+The nested serializer remains an important area for future optimization, particularly around traversal, allocation, buffer management, and nested object/array handling.
+
+---
+
+# 8. System Architecture
+
+The project is split into a backend API, native serializer, data-generation layer, and browser-based benchmark frontend.
+
+```text
+                         ┌──────────────────────────┐
+                         │     Benchmark Dashboard  │
+                         │       Frontend UI        │
+                         └────────────┬─────────────┘
+                                      │
+                                      │ HTTP benchmark request
+                                      ▼
+                         ┌──────────────────────────┐
+                         │       API Service        │
+                         │        main.py           │
+                         └────────────┬─────────────┘
+                                      │
+                    ┌─────────────────┼─────────────────┐
+                    │                 │                 │
+                    ▼                 ▼                 ▼
+             ┌────────────┐   ┌──────────────┐   ┌──────────────┐
+             │ DB / Data  │   │ Serialization │   │ Compression  │
+             │ Retrieval  │   │              │   │              │
+             └────────────┘   └──────┬───────┘   └──────────────┘
+                                     │
+                              ┌──────▼───────┐
+                              │ Native C++   │
+                              │ TOON Encoder │
+                              └──────┬───────┘
+                                     │
+                                     ▼
+                              ┌──────────────┐
+                              │ HTTP Response│
+                              └──────────────┘
+```
+
+For a normal uncached request, the benchmark therefore observes the combined cost of retrieval, representation generation, optional compression, server-side overhead, and HTTP delivery.
+
+For a cached request, previously generated response material can be reused, changing the hot path substantially.
+
+---
+
+# 9. Backend Architecture
+
+The backend lives under:
+
+```text
+deploy/api/
+```
+
+Its main responsibilities are:
+
+1. expose the benchmark API
+2. load or retrieve benchmark data
+3. select JSON or TOON
+4. invoke the native TOON serializer
+5. apply optional Brotli compression
+6. measure timing components
+7. return benchmark results
+8. expose cache behavior for the cache experiments
+
+The main entry point is:
+
+```text
 deploy/api/main.py
+```
 
-The service is responsible for:
+The service is deployed on stable Render Pro-tier infrastructure for the final research collection.
 
-receiving benchmark requests
+The benchmark uses a persistent HTTP connection throughout a run so that repeated connection establishment does not dominate the measurements.
 
-selecting the workload
+---
 
-retrieving the requested data
+# 10. Native and Cross-Source Experimental Modes
 
-selecting JSON or TOON
+The format/compression experiments contain two source conditions.
 
-serializing the data
+## Native (primary)
 
-applying optional Brotli compression
+The requested output format is associated with the primary source representation used by the benchmark configuration.
 
-recording timing information
+This approximates the normal serving path.
 
-returning the HTTP response
+## Cross (opposite DB)
 
-The frontend communicates with this service to execute benchmark configurations and display the measurements.
+The benchmark deliberately uses the **opposite source representation**.
 
-8. Dataset Generation
+For example, a TOON response can be generated from the JSON-side source, while a JSON response can be generated from the TOON-side source.
 
-Dataset generation is handled by:
+The purpose is methodological rather than architectural.
 
-deploy/api/build_data.py
+A native-only benchmark can accidentally favor a representation because the upstream data is already stored in or prepared for that representation.
 
-The generated source files are:
+The Cross condition removes some of that locality.
 
-deploy/api/data/
-├── dataset_flat.json
-├── dataset_flat.toon
-├── dataset_nested.json
-└── dataset_nested.toon
+Therefore:
 
-The JSON and TOON files represent the same logical datasets in their respective formats.
+```text
+Native:
+source representation → requested output
 
-9. Native and Cross-Source Modes
+Cross:
+opposite source representation → requested output
+```
 
-The format/compression experiments use two source modes.
+If a performance relationship survives both conditions, there is stronger evidence that the result is associated with the serving representation and processing pipeline rather than simply with source-format preparation.
 
-Native (primary)
+---
 
-Native uses the primary data source associated with the benchmark configuration. It represents the normal serving path.
+# 11. Why Cross-Source Testing Matters for Legacy Systems
 
-Cross (opposite DB)
+Cross-source testing also represents a realistic integration scenario.
 
-Cross deliberately uses the opposite source representation.
+A company may have:
 
-The purpose is methodological: it reduces the possibility that a format receives an unfair advantage simply because the source data was already prepared in that same representation.
+```text
+existing database
+       ↓
+existing JSON application code
+       ↓
+existing API ecosystem
+```
 
-Cross therefore asks whether the observed output-format advantage persists when the upstream source representation is changed.
+and may not want to rewrite its entire data layer merely to experiment with a new wire representation.
 
-This is also relevant to legacy-system integration. Existing organizations may already have JSON-oriented data pipelines and may not want to rewrite their upstream application and database logic merely to introduce a different wire representation.
+A practical deployment could instead introduce TOON at a boundary:
 
-The experiment therefore evaluates TOON as a representation/serving layer rather than requiring an entirely TOON-native application stack.
+```text
+Legacy JSON-oriented application
+              ↓
+       representation layer
+              ↓
+        TOON response
+              ↓
+          HTTP client
+```
 
-10. Benchmark Request Methodology
+The existing application and database can remain JSON-oriented while the response representation is changed at the serving boundary.
 
-Requests are fired server-side against the API service in randomized pairs:
+The Cross experiments therefore investigate whether a format can retain benefits even when the source representation is not already aligned with the requested output.
 
-JSON → TOON
-or
-TOON → JSON
+This is particularly relevant to adoption: **a representation format that requires an entire application rewrite has a much higher migration cost than one that can be introduced as a serving-layer optimization.**
 
-The direction is seeded.
+---
 
-A single persistent HTTP connection is used throughout a run, reducing repeated connection-establishment effects.
+# 12. Compression Pipeline
 
-The benchmark is therefore intended to compare the request/response processing path rather than repeatedly measuring connection setup.
+The benchmark evaluates four compression regimes.
 
-11. Warm-up and Repetitions
+## Identity
+
+No compression is applied.
+
+This isolates the raw representation and transport effects.
+
+## Brotli 5
+
+Moderate compression.
+
+This represents a middle regime where compression is meaningful but not pushed toward maximum computational cost.
+
+## Brotli 9
+
+Stronger compression.
+
+At this point compression CPU time becomes a significant component of the serving pipeline.
+
+## Brotli 11
+
+Very high Brotli compression effort.
+
+This configuration is particularly useful for observing whether TOON's smaller pre-compressed input can reduce compressor work enough to compensate for serialization overhead.
+
+The benchmark therefore does not assume:
+
+```text
+smaller payload = faster request
+```
+
+Instead it measures:
+
+```text
+serialization cost
++
+compression cost
++
+transport cost
+```
+
+together.
+
+---
+
+# 13. Benchmark Timing Model
+
+The measured serving path can be represented conceptually as:
+
+```text
+T_HTTP =
+    T_DB
+  + T_serialization
+  + T_compression
+  + T_overhead
+  + T_transport
+```
+
+The implementation records server-side components separately where possible.
+
+The API also records UTF-8 encoding time through:
+
+```text
+X-Utf8-Encoding-Time-Ms
+```
+
+For the main result matrix, UTF-8 encoding time is included in the reported server-processing/overhead path rather than being displayed as a separate table row.
+
+Consequently, small differences between the sum of displayed timing components and server-processing time can include UTF-8 encoding and other server-side overhead.
+
+---
+
+# 14. Benchmark Protocol
 
 The final research configuration uses:
 
-Records:        100,000
-Warm-up:        3
-Measured runs:  100
-Trials:         1
-Seed:           42
-Connection:     Persistent HTTP
+```text
+Records per workload:       100,000
+Warm-up requests:           3
+Measured repetitions:       100
+Trials:                     1
+Random seed:                42
+HTTP connection:            Persistent
+Request ordering:           Randomized pairs
+```
+
+For each randomized pair, the benchmark selects one direction:
+
+```text
+JSON → TOON
+```
+
+or
+
+```text
+TOON → JSON
+```
+
+The direction is seeded to make the ordering reproducible.
 
 The three warm-up requests are discarded.
 
-The following 100 requests form the reported measurement sample.
+The following 100 repetitions form the reported sample.
 
-12. Metrics
+The final collection was performed on stable Pro-tier deployment infrastructure after constrained-resource results were discarded.
 
-The benchmark records measurements at several stages.
+---
 
-Raw bytes
+# 15. Metrics Collected
 
-Uncompressed serialized response size.
+## Representation metrics
 
-Compressed bytes
+### Raw bytes
 
-Response size after Brotli compression.
+The number of bytes in the uncompressed response.
 
-DB retrieval mean
+### Compressed bytes
 
-Time required to retrieve the dataset.
+The number of bytes after the selected compression configuration.
 
-Serialization mean
+These measurements directly answer the compactness questions.
 
-Time required to serialize the retrieved data into JSON or TOON.
+## Server metrics
 
-Compression mean
+### DB retrieval mean
 
-Time required to compress the serialized representation.
+Mean database/data-source retrieval time.
 
-Server processing mean
+### Serialization mean
 
-Measured server-side processing time including the relevant server overhead.
+Mean time required to produce the JSON or TOON representation.
 
-HTTP latency
+### Compression mean
 
-Complete request latency, reported as:
+Mean time spent in the selected compression stage.
 
-mean
+### Server processing mean
 
-p50
+Overall measured server-side processing time, including the relevant overhead.
 
-p95
+## HTTP metrics
 
-The backend also records UTF-8 encoding time through:
+### HTTP latency mean
 
-X-Utf8-Encoding-Time-Ms
+Mean end-to-end request latency.
 
-For the main result tables, UTF-8 encoding is folded into the server-processing/overhead path rather than shown as a separate row. Consequently, small differences between displayed DB, serialization, compression, and server-processing components can include UTF-8 encoding and other measured server-side overhead.
+### HTTP latency p50
 
-13. Timing Model
+Median observed HTTP latency.
 
-The benchmark treats end-to-end request time as a combination of:
+### HTTP latency p95
 
-database retrieval
-+ serialization
-+ compression
-+ server-side overhead
-+ HTTP/network delivery
+Tail latency at the 95th percentile.
 
-This decomposition is important because a representation can be smaller while its encoder is slower.
+## Cache metrics
 
-The experiment therefore separates:
+The cache experiments additionally measure:
 
-Representation advantage
+- cache miss latency
+- cache hit rate
+- bytes
+- warm-cache mean
+- warm-cache p50
+- warm-cache p90
+- warm-cache p95
+- warm-cache p99
+- warm-cache standard deviation
+- warm-cache minimum
+- warm-cache maximum
+- sample count
 
-from:
+---
 
-Implementation/computational cost
+# 16. Cache Experiment
 
-and finally evaluates whether the combined effect appears in actual HTTP latency.
+Caching is treated as a separate experimental regime because it can remove expensive response-generation work from the repeated-request path.
 
-14. Compression Experiments
+The benchmark evaluates:
 
-Four compression regimes are evaluated:
-
-Identity
-Brotli 5
-Brotli 9
-Brotli 11
-
-Identity represents the uncompressed baseline.
-
-Brotli 5 represents moderate compression.
-
-Brotli 9 represents stronger compression.
-
-Brotli 11 represents a computationally expensive compression regime.
-
-The purpose is to determine whether TOON's structural compactness remains useful after a general-purpose compressor is applied.
-
-15. Cache-Layer Experiment
-
-Caching is evaluated separately because caching can remove serialization and compression from the repeated-request hot path.
-
-The cache benchmark records:
-
-cache miss latency
-
-cache hit rate
-
-bytes
-
-warm-cache mean latency
-
-warm-cache p50
-
-warm-cache p90
-
-warm-cache p95
-
-warm-cache p99
-
-warm-cache standard deviation
-
-warm-cache minimum/maximum
-
-sample count
-
-The cache configurations include:
-
+```text
 Canonical cache
 Native cache
+```
 
-The purpose is to determine whether TOON's compact representation becomes more directly beneficial once expensive response generation has been amortized.
+for flat and nested datasets.
 
-16. Why Caching Matters
+The cache experiment is not intended to claim that caching inherently makes one serialization format faster.
 
-The cache experiment answers a different question from the serialization benchmark.
+Instead, it asks:
 
-It asks:
+> Once response generation has been materialized, does the compact representation provide a stronger serving advantage?
 
-If response generation is already materialized, does TOON's smaller representation provide a stronger serving advantage?
+This isolates a different part of the format tradeoff.
 
-This is particularly important for repeated API responses.
+For example, the canonical flat cache experiment reported:
 
-The nested TOON serializer showed a measurable serialization penalty in the evaluated implementation. A cache can remove or amortize that cost, potentially exposing the payload and transport advantages much more directly.
+```text
+Cache miss latency
+JSON : 344.650 ms
+TOON :  66.003 ms
+```
 
-17. Key Experimental Findings
+with an approximately:
 
-The measured results show several important patterns.
-
-Identity / No Compression
-
-TOON reduces raw payload size substantially across the evaluated flat and nested workloads.
-
-The measured raw-size reduction is approximately:
-
-58–62%
-
-However, the nested workload also demonstrates that a smaller representation does not automatically mean a faster serializer.
-
-Brotli
-
-As compression becomes stronger, the absolute difference between JSON and TOON compressed sizes becomes smaller.
-
-At the same time, compression CPU time becomes increasingly important.
-
-At high Brotli levels, TOON's smaller input can reduce compressor work sufficiently to overcome its serialization penalty.
-
-Nested workloads
-
-Nested data exposes the cost of the current TOON C++ encoder more strongly than flat data.
-
-The nested encoder performs additional structural and memory-management work, producing higher serialization times than JSON in the measured implementation.
-
-Nevertheless, the resulting representation can still produce lower end-to-end latency.
-
-Cache
-
-The cache experiments show that TOON's compact representation can become especially valuable when serialization and compression are removed from the hot path.
-
-For example, the canonical flat cache experiment reports approximately:
-
-JSON cache miss latency: 344.65 ms
-TOON cache miss latency:  66.003 ms
-
-and approximately:
-
+```text
 80.85% improvement
+```
 
-The reported warm-cache mean is:
+The warm-cache mean was:
 
-JSON: 302.76 ms
-TOON:  33.65 ms
+```text
+JSON : 302.760 ms
+TOON :  33.650 ms
+```
 
-with approximately:
+with an approximately:
 
+```text
 88.89% improvement
+```
 
-18. Interpretation
+The warm-cache p95 was also substantially lower for TOON.
 
-The experiment does not establish that TOON is universally faster than JSON.
+These results illustrate why caching deserves independent analysis rather than being treated as another serialization measurement.
 
-Instead, it demonstrates that serialization-format performance depends on the surrounding serving pipeline.
+---
 
-A useful conceptual model is:
+# 17. Why the Results Are Not Reduced to Payload Size
 
-Format
-   ↓
-Serialization cost
-   ↓
-Compressed representation
-   ↓
-Compression cost
-   ↓
-Transport cost
-   ↓
-Caching
-   ↓
-End-to-end latency
+One of the main purposes of this repository is to avoid a misleading benchmark methodology.
 
-A format that wins on raw bytes can lose on serialization.
+A format can have:
 
-A format that loses on serialization can still win end-to-end if the resulting reduction in bytes sufficiently reduces compression or transport cost.
+```text
+smaller bytes
++
+slower serialization
+```
 
-19. Repository Structure
+and still be faster end-to-end.
 
-The principal project structure is:
+Conversely, a format can have:
 
+```text
+smaller bytes
++
+more expensive compression
+```
+
+and lose at a particular compression level.
+
+The benchmark therefore tracks the complete pipeline.
+
+The results demonstrate a computation-versus-transport tradeoff:
+
+```text
+                  More compact format
+                         │
+                         ▼
+                fewer bytes to compress
+                         │
+                         ▼
+                fewer bytes to transmit
+                         │
+                         ▼
+                 lower transport cost
+```
+
+against:
+
+```text
+             additional serialization work
+                         │
+                         ▼
+                additional CPU time
+```
+
+The observed winner depends on which side dominates.
+
+---
+
+# 18. Main Observations
+
+The final measurements show several consistent patterns.
+
+### Raw representation
+
+TOON reduces raw bytes by roughly **58–62%** for the evaluated workloads.
+
+### Identity / no compression
+
+With no compression, the representation-size advantage is exposed directly to the transport layer.
+
+The flat native identity configuration, for example, reports approximately:
+
+```text
+59.98% raw-byte reduction
+67.68% mean HTTP-latency improvement
+```
+
+The nested identity configurations also show substantial HTTP improvements despite the slower nested TOON serializer.
+
+### Nested serialization
+
+The nested workload exposes the current C++ TOON encoder's overhead more strongly.
+
+The serializer must handle:
+
+- nested objects
+- arrays
+- nulls
+- additional structural traversal
+- more complex output construction
+
+Therefore, TOON serialization can be substantially slower than JSON on nested workloads.
+
+This is an implementation cost, not evidence that compact representation itself requires more CPU in every possible encoder.
+
+### Brotli
+
+At moderate compression, the JSON and TOON byte sizes move closer together.
+
+At higher Brotli levels, however, the compressor becomes a major component of request cost.
+
+The smaller TOON input can then reduce compression work sufficiently to reverse the balance.
+
+The Brotli 11 configurations demonstrate this effect particularly strongly.
+
+---
+
+# 19. Important Performance Interpretation
+
+The experiment reveals a **compression-dependent crossover**.
+
+At low or moderate compression:
+
+```text
+representation advantage
+        ↓
+transport advantage
+```
+
+is visible, but serialization and compression costs remain significant.
+
+At aggressive compression:
+
+```text
+compression CPU
+        ↓
+dominant pipeline cost
+```
+
+becomes increasingly important.
+
+TOON's smaller input can then produce a computational saving inside the compressor.
+
+This means that the net benefit of TOON is not a monotonic function of compression level.
+
+The relevant question is:
+
+> How much additional CPU is spent producing and compressing the representation, and how much CPU/network work is avoided because the representation is smaller?
+
+The benchmark was designed specifically to expose this interaction.
+
+---
+
+# 20. Why the Native C++ Encoder Is Important
+
+The experiment should not be interpreted as:
+
+> "The current TOON serializer is already optimal."
+
+It is the opposite.
+
+The current implementation provides a practical C++ baseline and allows the experiment to quantify how much serialization overhead currently exists.
+
+The most interesting engineering opportunity is therefore:
+
+```text
+TOON compactness
+       +
+optimized C++ encoder
+       +
+existing compression pipeline
+       +
+HTTP transport
+```
+
+If serializer overhead is reduced, the representation advantage observed in the current benchmark could become stronger.
+
+The nested workload is particularly valuable here because it identifies the part of the implementation where optimization is most likely to matter.
+
+---
+
+# 21. Repository Structure
+
+The repository is organized around the separation between the deployed API, native serializer, datasets, frontend, and deployment configuration.
+
+```text
 toon-benchmark/
 │
 ├── deploy/
 │   │
 │   ├── api/
+│   │   │
 │   │   ├── data/
 │   │   │   ├── dataset_flat.json
 │   │   │   ├── dataset_flat.toon
@@ -528,258 +876,485 @@ toon-benchmark/
 │   │   │
 │   │   ├── toon_cpp/
 │   │   │   ├── build/
-│   │   │   ├── toon_cpp.cpp
-│   │   │   ├── setup.py
+│   │   │   ├── toon_cpp.egg-info/
 │   │   │   ├── pyproject.toml
-│   │   │   └── toon_cpp*.pyd
+│   │   │   ├── setup.py
+│   │   │   └── toon_cpp.cpp
 │   │   │
+│   │   ├── toon_cpp.cpython-312-win_amd64.pyd
 │   │   ├── build_data.py
 │   │   ├── main.py
 │   │   └── requirements.txt
 │   │
 │   └── frontend/
+│       │
 │       ├── static/
-│       └── toon_cpp/
+│       │
+│       ├── toon_cpp/
+│       │   ├── toon_cpp.egg-info/
+│       │   ├── pyproject.toml
+│       │   ├── setup.py
+│       │   ├── toon_cpp.cpython-312-win_amd64.pyd
+│       │   └── toon_cpp.cpp
+│       │
+│       ├── main.py
+│       └── requirements.txt
 │
-├── README.md
 ├── .gitignore
+├── README.md
 └── render.yaml
+```
 
-20. Benchmark Dashboard
+> **Note:** the compiled `.pyd` and build/egg-info directories are platform/build artifacts. A fresh environment may need to rebuild the native extension for its own Python version and operating system.
 
-The frontend benchmark dashboard allows researchers to configure:
+---
 
-case type
+# 22. File-by-File Description
 
-flat/nested structure
+## `deploy/api/main.py`
 
-record count
+The primary backend/API service.
 
-compression
+It handles the benchmark request path and exposes the functionality required by the benchmark dashboard.
 
-Brotli level
+Conceptually:
 
-database source
+```text
+request
+  ↓
+configuration
+  ↓
+data retrieval
+  ↓
+JSON / TOON serialization
+  ↓
+optional Brotli compression
+  ↓
+timing collection
+  ↓
+HTTP response
+```
 
-warm-up count
+---
 
-repetitions
+## `deploy/api/build_data.py`
 
-trials
+Dataset-generation utility.
 
-random seed
+It generates the controlled benchmark workloads and maintains the JSON/TOON representations used by the experiment.
 
-Results are presented with JSON and TOON values alongside:
+The generated files are placed under:
 
-absolute difference
+```text
+deploy/api/data/
+```
 
-percentage improvement
+---
 
-The dashboard also provides JSON and CSV result downloads.
+## `deploy/api/data/dataset_flat.json`
 
-21. Result Artifacts
+JSON representation of the 100,000-record flat dataset.
 
-The experiment uses a consistent naming convention for result screenshots.
+---
+
+## `deploy/api/data/dataset_flat.toon`
+
+TOON representation of the same logical flat dataset.
+
+---
+
+## `deploy/api/data/dataset_nested.json`
+
+JSON representation of the 100,000-record nested dataset.
+
+---
+
+## `deploy/api/data/dataset_nested.toon`
+
+TOON representation of the same logical nested dataset.
+
+---
+
+## `deploy/api/toon_cpp/toon_cpp.cpp`
+
+Native C++ implementation of the TOON serializer exposed to Python.
+
+This is one of the most important files in the benchmark because serialization time is explicitly measured as part of the serving pipeline.
+
+---
+
+## `deploy/api/toon_cpp/setup.py`
+
+Build/install configuration for the native C++ Python extension.
+
+---
+
+## `deploy/api/toon_cpp/pyproject.toml`
+
+Python build-system metadata for the C++ extension.
+
+---
+
+## `deploy/api/toon_cpp/build/`
+
+Generated build artifacts for the native extension.
+
+---
+
+## `deploy/api/toon_cpp/toon_cpp.egg-info/`
+
+Python packaging metadata generated during extension packaging/building.
+
+---
+
+## `deploy/api/toon_cpp.cpython-312-win_amd64.pyd`
+
+Compiled Python extension for the corresponding CPython/platform build.
+
+A platform-specific binary should not be assumed to work on every operating system or Python version.
+
+---
+
+## `deploy/frontend/main.py`
+
+Frontend/dashboard application.
+
+It provides the interactive benchmark interface used to configure and execute experimental cases and display the resulting measurement table.
+
+---
+
+## `deploy/frontend/static/`
+
+Static frontend assets.
+
+---
+
+## `deploy/frontend/toon_cpp/`
+
+Frontend-side copy/build configuration associated with the native TOON extension used by the project structure.
+
+It contains the corresponding C++ source and Python build metadata.
+
+---
+
+## `render.yaml`
+
+Deployment configuration for the Render-based deployment.
+
+The final research measurements were collected from stable Pro-tier deployment infrastructure.
+
+---
+
+# 23. Benchmark Dashboard
+
+The dashboard exposes the benchmark dimensions directly rather than hiding them behind a fixed script.
+
+Depending on the selected case, the interface allows configuration of:
+
+- case type
+- flat/nested structure
+- record count
+- compression mode
+- Brotli level
+- database/source mode
+- cache mode
+- warm-up count
+- number of repetitions
+- trial count
+- seed
+
+A completed benchmark reports the JSON and TOON measurements together.
+
+For format/compression experiments, the result table includes:
+
+```text
+Metric
+JSON
+TOON
+Abs diff
+Improvement
+```
+
+For cache experiments, the result table additionally exposes cache-specific statistics.
+
+The interface also provides:
+
+```text
+Download JSON
+Download CSV (samples)
+```
+
+so the measurements can be retained outside the dashboard.
+
+---
+
+# 24. Result Artifact Naming
+
+The result screenshots use a deterministic naming scheme.
+
+### Format/compression results
+
+```text
+plain_<structure>_n100000_<compression>_<source>.png
+```
 
 Examples:
 
+```text
 plain_flat_n100000_none_native.png
 plain_flat_n100000_none_cross.png
-
 plain_flat_n100000_brotli5_native.png
 plain_flat_n100000_brotli5_cross.png
-
-plain_flat_n100000_brotli9_native.png
-plain_flat_n100000_brotli9_cross.png
-
-plain_flat_n100000_brotli11_native.png
-plain_flat_n100000_brotli11_cross.png
-
-plain_nested_n100000_none_native.png
-plain_nested_n100000_none_cross.png
-
-plain_nested_n100000_brotli5_native.png
-plain_nested_n100000_brotli5_cross.png
-
-plain_nested_n100000_brotli9_native.png
-plain_nested_n100000_brotli9_cross.png
-
 plain_nested_n100000_brotli11_native.png
 plain_nested_n100000_brotli11_cross.png
+```
 
-Cache figures use:
+### Cache results
 
+```text
+cache_<structure>_n100000_<cache-mode>.png
+```
+
+Examples:
+
+```text
 cache_flat_n100000_canonical.png
 cache_flat_n100000_native.png
 cache_nested_n100000_canonical.png
 cache_nested_n100000_native.png
+```
 
-22. Reproducing the Project
+This naming convention makes every result independently traceable to its experimental condition.
 
-Clone the repository:
+---
 
-git clone https://github.com/debugaditya/toon-benchmark.git
-cd toon-benchmark
+# 25. Research Paper
 
-The API implementation is under:
+The associated research paper is:
 
-deploy/api/
-
-The datasets are under:
-
-deploy/api/data/
-
-The native TOON implementation is under:
-
-deploy/api/toon_cpp/
-
-The main API entry point is:
-
-deploy/api/main.py
-
-Dataset generation is:
-
-deploy/api/build_data.py
-
-Because the TOON serializer is a compiled Python extension, a fresh environment may require rebuilding the extension for the local Python version and operating system.
-
-23. Research Paper
-
-The accompanying research paper is:
-
-TOON vs JSON: An Experimental Evaluation of Serialization, Compression, and End-to-End HTTP Performance
+> **TOON vs. JSON: An Experimental Evaluation of Serialization, Compression, and End-to-End HTTP Performance**
 
 The paper documents:
 
-motivation
+- research motivation
+- research questions
+- hypotheses
+- system architecture
+- dataset construction
+- C++ serializer implementation
+- experimental protocol
+- Native/Cross methodology
+- compression results
+- cache-layer results
+- complete result matrix
+- discussion
+- engineering implications
+- limitations
+- future work
 
-research questions
+The figures used in the paper correspond directly to the benchmark result artifacts.
 
-hypotheses
+---
 
-system architecture
+# 26. Reproducing the Experiment
 
-dataset construction
+Clone the repository:
 
-serializer implementation
+```bash
+git clone https://github.com/debugaditya/toon-benchmark.git
+cd toon-benchmark
+```
 
-experimental methodology
+Move to the API implementation:
 
-Native/Cross methodology
+```bash
+cd deploy/api
+```
 
-compression experiments
+Install the Python dependencies:
 
-cache experiments
+```bash
+pip install -r requirements.txt
+```
 
-complete result matrix
+The native TOON extension is built from:
 
-discussion
+```text
+deploy/api/toon_cpp/
+```
 
-engineering implications
+Depending on the platform, the extension may need to be rebuilt.
 
-limitations
+The dataset generator is:
 
-future work
+```bash
+python build_data.py
+```
 
-24. Limitations
+The API entry point is:
 
-The results should be interpreted within the scope of this experimental setup.
+```bash
+python main.py
+```
 
-Important limitations include:
+The exact deployment configuration and benchmark UI are contained in the repository.
 
-The datasets are controlled benchmark workloads.
+---
 
-Each final configuration uses one trial with 100 measured repetitions.
+# 27. Interpreting the Benchmark Correctly
 
-The TOON serializer is optimized for the evaluated data structures.
+These results should be interpreted as a **systems benchmark**, not a universal ranking of serialization formats.
 
-Results depend on the deployment infrastructure and network conditions.
+The benchmark answers:
 
-The experiment does not establish a theoretical maximum for TOON performance.
+> What happens when the evaluated JSON and TOON implementations are placed into this particular API serving pipeline under these controlled workload and deployment conditions?
 
-Different schemas, workloads, hardware, compression algorithms, and clients may produce different results.
+It does not establish:
 
-Additional independent trials would be required for stronger statistical inference.
+- that every TOON implementation is faster than every JSON implementation
+- that every workload will show the same byte reduction
+- that every network environment will show the same latency reduction
+- that the current C++ serializer is optimal
+- that one compression level is universally best
 
-The nested serializer overhead also motivates future optimization of allocation, traversal, string handling, and buffer management.
+Instead, the experiment demonstrates how the interaction between representation, implementation, compression, caching, and transport can change the final result.
 
-25. Future Work
+---
 
-Future work can investigate:
+# 28. Limitations
 
-further C++ TOON encoder optimization
+The main limitations are:
 
-memory allocation and buffer management
+1. The workloads are controlled synthetic datasets.
+2. Each final configuration uses one trial with 100 measured repetitions.
+3. The C++ TOON serializer is specialized for the benchmark data shapes.
+4. The measurements depend on the deployed infrastructure and network conditions.
+5. Only the selected compression configurations were evaluated.
+6. Additional independent trials would provide stronger statistical evidence.
+7. Different schemas may produce different serialization and compression behavior.
+8. The experiment does not claim a universal TOON-versus-JSON performance ranking.
 
-deeper nested structures
+The most direct implementation limitation is the cost of nested TOON serialization.
 
-larger record counts
+This is also a useful future-work direction because optimization of the encoder can be evaluated using the exact same benchmark matrix.
 
-different data distributions
+---
 
-additional compression algorithms
+# 29. Future Work
 
-gzip and zstd
+The benchmark can be extended in several directions.
 
-concurrent clients
+### Serializer optimization
 
-throughput
+- reduce allocations
+- improve buffer management
+- optimize nested traversal
+- optimize array handling
+- reduce string-copying
+- improve schema-aware encoding
+- benchmark allocator behavior
 
-CPU utilization
+### Workload expansion
 
-memory utilization
+- larger record counts
+- deeper nesting
+- wider schemas
+- different null distributions
+- different string lengths
+- different array sizes
+- realistic production datasets
 
-multiple independent trials
+### Compression expansion
 
-confidence intervals
+- gzip
+- zstd
+- additional Brotli configurations
+- compression-level sweeps
 
-statistical significance
+### Systems evaluation
 
-additional caching strategies
+- concurrent clients
+- requests per second
+- CPU utilization
+- memory utilization
+- bandwidth consumption
+- multiple persistent connections
+- connection pooling
+- varying network conditions
 
-real production API workloads
+### Statistical validation
 
-The same benchmark matrix can be rerun after serializer optimization to isolate how much of the observed performance difference is caused by the representation itself versus the current encoder implementation.
+- multiple independent trials
+- confidence intervals
+- variance analysis
+- significance testing
+- repeated deployment runs
 
-26. Repository and Contact
+### Cache research
 
-Repository:
+- different cache capacities
+- different hit/miss distributions
+- cache eviction policies
+- serialized-response caching
+- compressed-response caching
+- multi-client cache behavior
 
+---
+
+# 30. Why This Repository Exists
+
+The main objective is reproducibility.
+
+A claim such as:
+
+> "TOON is 60% smaller than JSON"
+
+is incomplete as a systems result.
+
+The more meaningful questions are:
+
+```text
+How much CPU does serialization require?
+How much CPU does compression require?
+How many bytes remain after compression?
+How does the result affect HTTP latency?
+What happens for nested data?
+What happens when the source is not native to the output format?
+What happens after the response is cached?
+```
+
+This repository provides the implementation and benchmark structure required to investigate those questions.
+
+The benchmark therefore treats serialization format as one component of a larger API performance pipeline.
+
+---
+
+# 31. Contact and Experiment Source
+
+For questions about the implementation, experimental design, measurements, or possible extensions:
+
+**Email:** `adibarmola@gmail.com`
+
+The complete experiment source and benchmark implementation are available at:
+
+**Experiment Setup:**  
 https://github.com/debugaditya/toon-benchmark
 
-Author:
+---
 
-Aditya Narayan Barmola
+## License / Usage
 
-Email:
+See the repository for the applicable project files and configuration.
 
-adibarmola@gmail.com
+If you use this benchmark or extend the experimental matrix, please preserve the workload conditions and clearly document any changes to:
 
-Institution:
+- serializer implementation
+- dataset
+- compression level
+- cache configuration
+- infrastructure
+- repetitions
+- trial count
+- measurement methodology
 
-Netaji Subhas University of Technology (NSUT)
-New Delhi, India
-
-27. Summary
-
-The central conclusion of this experiment is that serialization formats should be evaluated as part of the complete serving pipeline rather than by payload size alone.
-
-TOON substantially reduces the raw representation size for the evaluated datasets. However, the current C++ encoder introduces additional serialization cost, especially for nested structures.
-
-The end-to-end outcome therefore depends on the interaction between:
-
-representation
-+ serialization
-+ compression
-+ caching
-+ transport
-
-Without compression, TOON's smaller representation can produce a substantial HTTP advantage.
-
-Under moderate compression, the advantage becomes more dependent on the balance between serializer and compressor costs.
-
-At high compression levels, TOON's smaller input can reduce compression work enough to produce large end-to-end improvements.
-
-The cache experiments further show that when response-generation work is amortized, the compact representation can become even more directly beneficial.
-
-The repository provides the implementation and experimental artifacts needed to inspect, reproduce, extend, and challenge these findings.
+That distinction is important when comparing new measurements with the results reported in the accompanying research paper.
